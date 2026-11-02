@@ -243,7 +243,7 @@ static void RQ_Swap_hook(char*& cmd) {
 ON_MOD_PRELOAD() { LOG("SAFX preload"); }
 
 ON_MOD_LOAD() {
-    void* h = aml->GetLibHandle("libGTASA.so");
+    void* h = (void*)aml->GetLibHandle("libGTASA.so");
     if (!h) { LOG("no se encontro libGTASA.so"); return; }
 
     g_curStored  = (int*)  aml->GetSym(h, "_ZN10CTimeCycle20m_CurrentStoredValueE");
@@ -251,7 +251,7 @@ ON_MOD_LOAD() {
     g_sunScrX    = (float*)aml->GetSym(h, "_ZN8CCoronas10SunScreenXE");
     g_sunScrY    = (float*)aml->GetSym(h, "_ZN8CCoronas10SunScreenYE");
     g_sunBlocked = (bool*) aml->GetSym(h, "_ZN8CCoronas18SunBlockedByCloudsE");
-    void* swap   =         aml->GetSym(h, "_Z24RQ_Command_rqSwapBuffersRPc");
+    void* swap   = (void*) aml->GetSym(h, "_Z24RQ_Command_rqSwapBuffersRPc");
 
     if (!g_curStored || !g_vecToSun || !g_sunScrX || !g_sunScrY || !g_sunBlocked || !swap) {
         LOG("faltan simbolos, plugin desactivado");
