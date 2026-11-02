@@ -407,6 +407,7 @@ static void UploadGameUniforms() {
 }
 
 // =============================== EFECTOS EN PANTALLA ===============================
+// =============================== EFECTOS EN PANTALLA ===============================
 #include <sys/stat.h>
 static float* pHeat = nullptr; static float* pWetRoads = nullptr; static int* pArea = nullptr;
 
@@ -420,25 +421,26 @@ static uint64_t Menu_hook(void* self) { gMenuCount = gMenuCount + 1; return Menu
 
 struct Cfg2 {
     float exposure = 1.0f, tonemap = 0.35f, gamma = 1.0f, wb = 0.02f;
-    float vignette = 0.25f, grain = 0.03f, chroma = 0.0015f, sharpen = 0.25f;
-    float fxaa = 1, heat = 1, wet = 0.5f;
+    float vignette = 0.25f, grain = 0.03f, chroma = 0.0005f, sharpen = 0.25f;
+    float fxaa = 1, heat = 0, wet = 0.5f;
     float stR = 0.00f, stG = 0.02f, stB = 0.05f, htR = 0.05f, htG = 0.03f, htB = 0.00f;
 } D;
 struct Cfg3 {
     float master = 1, rain3d = 1, drops = 3500, radius = 30, length = 1.5f, speed = 20, bright = 1.0f, width = 1.0f;
+    float samples = 48, cfgVer = 0;
 } R;
 
 // ---- archivo de configuracion: <configs de AML>/SAFX64.ini ----
 struct Ent { const char* sec; const char* key; float* v; };
 static Ent kEnt[] = {
-    {"General","Enable",&R.master},
+    {"General","Enable",&R.master},{"General","ConfigVersion",&R.cfgVer},
     {"Post","Tonemap",&D.tonemap},{"Post","Exposure",&D.exposure},{"Post","Gamma",&D.gamma},{"Post","WhiteBalance",&D.wb},
     {"Post","Saturation",&C.sat},{"Post","Contrast",&C.contrast},{"Post","Sharpen",&D.sharpen},{"Post","FilmGrain",&D.grain},
     {"Post","Vignette",&D.vignette},{"Post","ChromaticAberration",&D.chroma},{"Post","FXAA",&D.fxaa},
     {"Grading","ShadowTintR",&D.stR},{"Grading","ShadowTintG",&D.stG},{"Grading","ShadowTintB",&D.stB},
     {"Grading","HighlightTintR",&D.htR},{"Grading","HighlightTintG",&D.htG},{"Grading","HighlightTintB",&D.htB},
     {"Bloom","Enable",&C.bloom},{"Bloom","Intensity",&C.bloomInt},{"Bloom","Threshold",&C.bloomThr},
-    {"SunRays","Enable",&C.godRays},{"SunRays","Intensity",&C.rayInt},{"SunRays","Density",&C.rayDens},{"SunRays","Threshold",&C.rayThr},
+    {"SunRays","Enable",&C.godRays},{"SunRays","Intensity",&C.rayInt},{"SunRays","Samples",&R.samples},{"SunRays","Density",&C.rayDens},{"SunRays","Threshold",&C.rayThr},
     {"SunRays","TintR",&C.tintR},{"SunRays","TintG",&C.tintG},{"SunRays","TintB",&C.tintB},
     {"LensFlare","Enable",&C.flare},{"LensFlare","Intensity",&C.flareInt},
     {"Rain","Enable",&C.rain},{"Rain","Rain3D",&R.rain3d},{"Rain","Drops",&R.drops},{"Rain","Radius",&R.radius},
@@ -453,7 +455,7 @@ static const char* ToCStr(const char* s) { return s; }
 static const char* ToCStr(const std::string& s) { static std::string keep; keep = s; return keep.c_str(); }
 
 static void LoadConfig3() {
-    C.rayInt = 0.85f; C.tintR = 1.f; C.tintG = 1.f; C.tintB = 1.f;   // valores por defecto de v0.4
+    C.rayInt = 1.6f; C.rayThr = 0.62f; C.tintR = 1.f; C.tintG = 1.f; C.tintB = 1.f;   // valores por defecto
     const int NE = (int)(sizeof(kEnt) / sizeof(kEnt[0]));
     bool found[128] = {false};
     char dir[300];
@@ -480,6 +482,9 @@ static void LoadConfig3() {
     }
     bool missing = false;
     for (int i = 0; i < NE; i++) if (!found[i]) missing = true;
+    if (R.cfgVer < 2.f) {   // config de una version vieja: aplicar los valores nuevos y reescribir
+        C.rayInt = 1.6f; C.rayThr = 0.62f; D.chroma = 0.0005f; D.heat = 0.f; R.samples = 48.f; R.cfgVer = 2.f; missing = true;
+    }
     if (missing) {
         FILE* o = fopen(path, "w");
         if (o) {
@@ -558,8 +563,8 @@ void main(){
   vec2 uv = vUV;
   if (uE.x > 0.001) {
     float band = smoothstep(0.15, 0.55, uv.y) * smoothstep(0.95, 0.60, uv.y);
-    vec2 n = vec2(sin(uv.y * 70.0 + uB.x * 2.3), cos(uv.x * 55.0 + uB.x * 1.9));
-    uv += n * 0.0020 * uE.x * band;
+    vec2 n = vec2(sin(uv.y * 22.0 + uB.x * 1.3), cos(uv.x * 18.0 + uB.x * 1.1));
+    uv += n * 0.0006 * uE.x * band;
   }
   vec3 scene = (uE.z > 0.5) ? fxaa(uv) : texture2D(uScene, uv).rgb;
   if (uD.z > 0.00001) {
@@ -580,18 +585,19 @@ void main(){
   // rayos: solo la forma de la luz; el color viene de la hora del dia (amarillo/naranja)
   vec3 rr = texture2D(uRays, vUV).rgb;
   float rm = max(rr.r, max(rr.g, rr.b));
-  vec3 rays = vec3(pow(rm, 1.4)) * exp(-dsun * 2.0) * uA.x * uTint;
-  rays *= mix(0.45, 1.0, smoothstep(0.0, 0.35, length(sc)));
+  rm = clamp((rm - 0.15) / 0.85, 0.0, 1.0);
+  vec3 rays = vec3(pow(rm, 1.6)) * exp(-dsun * 1.15) * uA.x * uTint;
+  rays *= mix(0.6, 1.0, smoothstep(0.0, 0.35, length(sc)));
   vec3 bloom = texture2D(uBloom, vUV).rgb * uA.y;
 
-  float fl = exp(-dsun * 7.0) * 0.50;
+  float fl = exp(-dsun * 5.0) * 0.55 + exp(-dsun * 16.0) * 0.55;
   fl += smoothstep(0.075, 0.020, length(pc + sc * 0.45)) * 0.16;
   fl += smoothstep(0.110, 0.040, length(pc + sc * 0.85)) * 0.10;
   fl += smoothstep(0.050, 0.015, length(pc + sc * 1.45)) * 0.14;
   fl *= smoothstep(0.0, 0.25, length(sc)) * 0.6 + 0.4;
   vec3 flare = fl * uA.z * uTint;
 
-  vec3 glow = min(rays + bloom + flare, vec3(0.75));
+  vec3 glow = min(rays + bloom + flare, vec3(0.88));
   vec3 col = scene + (1.0 - scene) * glow;
 
   if (uA.w > 0.002) {
@@ -624,6 +630,28 @@ void main(){
   gl_FragColor = vec4(col, 1.0);
 }
 )GLSL";
+
+static const char* kFSRays2 = R"GLSL(
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform sampler2D uTex; uniform vec2 uSun; uniform float uDens; uniform float uSamples; uniform float uDecay; varying vec2 vUV;
+float jit(vec2 p){ return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+void main(){
+  vec2 delta = (uSun - vUV) * uDens / uSamples;
+  vec2 uv = vUV + delta * jit(vUV * 513.0);
+  float w = 1.0; float ws = 0.0; vec3 acc = vec3(0.0);
+  for (int i = 0; i < 64; i++) {
+    if (float(i) >= uSamples) break;
+    uv += delta;
+    acc += texture2D(uTex, uv).rgb * w; ws += w; w *= uDecay;
+  }
+  gl_FragColor = vec4(acc / ws, 1.0);
+}
+)GLSL";
+static Prog pRays2;
 
 struct FinalLocs { GLint scene, rays, bloom, sun, A, B, tint, C, D, E, F, G, H; };
 static Prog pFinal2; static FinalLocs fl;
@@ -779,7 +807,17 @@ static void RunFX() {
     bool menu = menuNow != lastMenu; lastMenu = menuNow;
     bool scene = sceneNow != lastScene; lastScene = sceneNow;
     if (sceneNow > 0) sceneSeen = true;
-    if (menu || (sceneSeen && !scene)) return;      // menus: sin efectos (evita la capa blanca)
+    static bool symsInit = false; static void* pPlayers = nullptr; static uint32_t* pTimeMs = nullptr;
+    if (!symsInit) {
+        symsInit = true;
+        void* hh = (void*)aml->GetLibHandle("libGTASA.so");
+        if (hh) { pPlayers = (void*)aml->GetSym(hh, "_ZN6CWorld7PlayersE"); pTimeMs = (uint32_t*)aml->GetSym(hh, "_ZN6CTimer22m_snTimeInMillisecondsE"); }
+        LOG("compuerta de menu: players=%p timer=%p", pPlayers, (void*)pTimeMs);
+    }
+    bool worldLoaded = true;   // falso en el menu de inicio (aun no hay partida)
+    if (pTimeMs && *pTimeMs == 0) worldLoaded = false;
+    if (worldLoaded && pPlayers) { uintptr_t ped = 0; if (SafeRead(pPlayers, &ped, sizeof ped) && ped == 0) worldLoaded = false; }
+    if (menu || !worldLoaded || (sceneSeen && !scene)) return;      // menus: sin efectos
 
     int w, h; ScreenSize(w, h);
     if (w < 64 || h < 64) return;
@@ -833,6 +871,13 @@ static void RunFX() {
         Restore(s0);
         if (!gReady) { gFailed = true; return; }
     }
+    if (!pRays2.id) {
+        pRays2.id = Link(kVS, kFSRays2);
+        if (!pRays2.id) { LOG("shader de rayos no compila"); gFailed = true; return; }
+        pRays2.a = glGetUniformLocation(pRays2.id, "uTex"); pRays2.b = glGetUniformLocation(pRays2.id, "uSun");
+        pRays2.c = glGetUniformLocation(pRays2.id, "uDens"); pRays2.d = glGetUniformLocation(pRays2.id, "uSamples");
+        pRays2.e = glGetUniformLocation(pRays2.id, "uDecay");
+    }
     if (!pFinal2.id) {
         pFinal2.id = Link(kVS, kFSFinal2);
         if (!pFinal2.id) { LOG("shader final no compila, efectos de pantalla desactivados"); gFailed = true; return; }
@@ -848,7 +893,6 @@ static void RunFX() {
 
     GLState st; Save(st);
     UploadGameUniforms();
-
 
     // lluvia 3D (se dibuja antes del post-proceso para que reciba bloom y color)
     bool rain3dDone = false;
@@ -874,8 +918,10 @@ static void RunFX() {
         }
         if (rayK > 0.005f) {
             Target(tRays, hW, hH);
-            glUseProgram(pRays.id); glUniform1i(pRays.a, 0);
-            glUniform2f(pRays.b, u, v); glUniform1f(pRays.c, C.rayDens);
+            float ns = fminf(fmaxf(R.samples, 8.f), 64.f);
+            glUseProgram(pRays2.id); glUniform1i(pRays2.a, 0);
+            glUniform2f(pRays2.b, u, v); glUniform1f(pRays2.c, C.rayDens);
+            glUniform1f(pRays2.d, ns); glUniform1f(pRays2.e, powf(0.96f, 28.f / ns));
             glBindTexture(GL_TEXTURE_2D, tBright); DrawTri();
         }
         if (bloomK > 0.005f) {
@@ -912,7 +958,6 @@ static void Swap_hook(char*& cmd) {
     if (!gFailed) RunFX();
     Swap_orig(cmd);
 }
-
 // =============================== PARCHES DE SHADERS DEL JUEGO ===============================
 static bool TestCompile(const char* vs, const char* fs) {
     GLuint v = glCreateShader(GL_VERTEX_SHADER); if (!v) return false;
