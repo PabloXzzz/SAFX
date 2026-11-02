@@ -1,86 +1,274 @@
-// SAFX64 - Fase 1: god rays solares (post-proceso) para GTA SA Android 2.10 (arm64)
-// Se carga con AML desde la carpeta mods/ como libSAFX64.so
+// SAFX64 v0.2 - efectos graficos para GTA SA Android 2.10 (arm64) con AML
+// God rays modernos, bloom, flare solar, lluvia en pantalla, viento en vegetacion, agua con fresnel/reflejo/brillo solar.
+// Configuracion: archivo SAFX.ini (se crea solo la primera vez, ver logcat tag SAFX para su ruta).
 
 #include <mod/amlmod.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 #include <android/log.h>
+#include <string>
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
 #include <math.h>
+#include <time.h>
+#include <unistd.h>
+#include <fcntl.h>
 
-MYMOD(net.safx.visuals, SAFX Visuals, 0.1, SAFX)
+MYMOD(net.safx.visuals, SAFX Visuals, 0.2, SAFX)
 
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "SAFX", __VA_ARGS__)
 
-// ------------------------- Ajustes (edita y recompila) -------------------------
-static const float kRayIntensity = 0.55f;   // fuerza de los rayos
-static const float kRayDensity   = 0.95f;   // largo del barrido hacia el sol (0..1)
-static const float kThreshold    = 0.60f;   // brillo minimo que genera rayos
-static const float kTint[3]      = { 1.00f, 0.92f, 0.78f }; // color calido
-static const int   kHalfDiv      = 2;       // resolucion del buffer de rayos (2 = mitad)
-// -------------------------------------------------------------------------------
+// =============================== CONFIG ===============================
+struct Cfg {
+    float godRays = 1, bloom = 1, flare = 1, rain = 1, wind = 1, water = 1;
+    float rayInt = 0.50f, rayDens = 0.90f, rayThr = 0.72f;
+    float bloomInt = 0.28f, bloomThr = 0.68f;
+    float flareInt = 0.35f;
+    float rainInt = 1.0f;
+    float treeSway = 0.30f, grassGain = 1.7f;
+    float waterFres = 0.70f, waterSpec = 1.0f;
+    float sat = 1.05f, contrast = 1.03f;
+    float tintR = 1.00f, tintG = 0.93f, tintB = 0.80f;
+} C;
 
-static int*   g_curStored  = nullptr; // CTimeCycle::m_CurrentStoredValue
-static float* g_vecToSun   = nullptr; // CTimeCycle::m_VectorToSun (CVector[16])
-static float* g_sunScrX    = nullptr; // CCoronas::SunScreenX
-static float* g_sunScrY    = nullptr; // CCoronas::SunScreenY
-static bool*  g_sunBlocked = nullptr; // CCoronas::SunBlockedByClouds
-static void (*RQ_Swap_orig)(char*&) = nullptr;
+struct KV { const char* k; float* v; };
+static KV kKeys[] = {
+    {"GodRays",&C.godRays},{"Bloom",&C.bloom},{"SunFlare",&C.flare},{"Rain",&C.rain},{"Wind",&C.wind},{"Water",&C.water},
+    {"RayIntensity",&C.rayInt},{"RayDensity",&C.rayDens},{"RayThreshold",&C.rayThr},
+    {"BloomIntensity",&C.bloomInt},{"BloomThreshold",&C.bloomThr},
+    {"FlareIntensity",&C.flareInt},{"RainIntensity",&C.rainInt},
+    {"TreeSway",&C.treeSway},{"GrassWindGain",&C.grassGain},
+    {"WaterFresnel",&C.waterFres},{"WaterSpecular",&C.waterSpec},
+    {"Saturation",&C.sat},{"Contrast",&C.contrast},
+    {"SunTintR",&C.tintR},{"SunTintG",&C.tintG},{"SunTintB",&C.tintB},
+};
 
-static bool   g_glReady = false, g_glFailed = false;
-static GLuint g_progRays = 0, g_progComp = 0;
-static GLuint g_sceneTex = 0, g_halfTex = 0, g_halfFbo = 0;
-static int    g_w = 0, g_h = 0, g_hw = 0, g_hh = 0;
-static GLint  uR_scene, uR_sun, uR_dens, uR_thr, uC_tex, uC_int, uC_tint;
+static void LoadConfig() {
+    char pkg[128] = "com.rockstargames.gtasa";
+    FILE* c = fopen("/proc/self/cmdline", "r");
+    if (c) { char b[128] = {0}; if (fgets(b, sizeof b, c) && b[0]) snprintf(pkg, sizeof pkg, "%s", b); fclose(c); }
+    char path[256];
+    snprintf(path, sizeof path, "/storage/emulated/0/Android/data/%s/SAFX.ini", pkg);
+    FILE* f = fopen(path, "r");
+    if (!f) {
+        f = fopen(path, "w");
+        if (f) {
+            fprintf(f, "# SAFX64 - 1 = activado, 0 = desactivado\n");
+            for (auto& kv : kKeys) fprintf(f, "%s=%.3f\n", kv.k, *kv.v);
+            fclose(f);
+            LOG("SAFX.ini creado en %s", path);
+        } else LOG("no pude crear %s, usando valores por defecto", path);
+        return;
+    }
+    char line[160];
+    while (fgets(line, sizeof line, f)) {
+        if (line[0] == '#' || line[0] == ';' || line[0] == '[') continue;
+        char* eq = strchr(line, '='); if (!eq) continue;
+        *eq = 0; char* key = line; char* val = eq + 1;
+        while (*key == ' ') key++;
+        for (char* e = key + strlen(key); e > key && (e[-1] == ' ' || e[-1] == '\t'); ) *--e = 0;
+        for (auto& kv : kKeys) if (!strcmp(kv.k, key)) *kv.v = (float)atof(val);
+    }
+    fclose(f);
+    LOG("SAFX.ini leido de %s", path);
+}
 
-static const GLfloat kTri[6] = { -1.f, -1.f,  3.f, -1.f,  -1.f, 3.f };
+// =============================== GAME POINTERS ===============================
+static int*   pCurStored = nullptr;
+static float* pVecToSun = nullptr;
+static float* pSunX = nullptr; static float* pSunY = nullptr;
+static bool*  pSunBlocked = nullptr;
+static float* pRain = nullptr; static float* pWind = nullptr; static float* pWindDir = nullptr;
+static float* pTunnel = nullptr; static float* pUnder = nullptr;
+static void*  pTheCamera = nullptr;
+typedef bool (*CalcScreenFn)(const float*, float*, float*, float*, bool, bool);
+static CalcScreenFn CalcScreen = nullptr;
 
-static const char* kVS =
-"attribute vec2 aPos; varying vec2 vUV;\n"
-"void main(){ vUV = aPos*0.5+0.5; gl_Position = vec4(aPos,0.0,1.0); }\n";
+typedef void     (*SwapFn)(char*&);
+typedef uint64_t (*BuildFn)(void*, const char*, const char*);
+typedef void     (*WindFn)(float);
+static SwapFn  Swap_orig = nullptr;
+static BuildFn Build_orig = nullptr;
+static WindFn  Wind_orig = nullptr;
 
-static const char* kFSRays =
-"precision mediump float;\n"
-"uniform sampler2D uScene; uniform vec2 uSun; uniform float uDens; uniform float uThr;\n"
-"varying vec2 vUV;\n"
-"void main(){\n"
-"  vec2 delta = (uSun - vUV) * uDens / 24.0;\n"
-"  vec2 uv = vUV; float w = 1.0; vec3 acc = vec3(0.0);\n"
-"  for (int i = 0; i < 24; i++) {\n"
-"    uv += delta;\n"
-"    vec3 c = texture2D(uScene, uv).rgb;\n"
-"    float l = dot(c, vec3(0.299,0.587,0.114));\n"
-"    acc += c * max(l - uThr, 0.0) * w;\n"
-"    w *= 0.95;\n"
-"  }\n"
-"  gl_FragColor = vec4(acc, 1.0);\n"
-"}\n";
+static int g_nWater = 0, g_nWind = 0, g_nPatchFail = 0;
 
-static const char* kFSComp =
-"precision mediump float;\n"
-"uniform sampler2D uTex; uniform float uInt; uniform vec3 uTint; varying vec2 vUV;\n"
-"void main(){ gl_FragColor = vec4(texture2D(uTex, vUV).rgb * uTint * uInt, 1.0); }\n";
+static inline float clamp01(float x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
+static inline float smooth(float a, float b, float x) { float t = clamp01((x - a) / (b - a)); return t * t * (3 - 2 * t); }
+static double NowSec() { timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec * 1e-9; }
+
+// =============================== LECTURA SEGURA / CAMARA ===============================
+static int g_pipe[2] = {-1, -1};
+static bool SafeRead(const void* src, void* dst, size_t n) {
+    if (g_pipe[0] < 0) {
+        if (pipe(g_pipe)) return false;
+        fcntl(g_pipe[0], F_SETFL, O_NONBLOCK); fcntl(g_pipe[1], F_SETFL, O_NONBLOCK);
+    }
+    ssize_t w = write(g_pipe[1], src, n);
+    if (w != (ssize_t)n) { char tmp[64]; while (read(g_pipe[0], tmp, sizeof tmp) > 0) {} return false; }
+    return read(g_pipe[0], dst, n) == (ssize_t)n;
+}
+static bool BasisOK(const float* m) {
+    auto len = [&](int o) { return sqrtf(m[o]*m[o] + m[o+1]*m[o+1] + m[o+2]*m[o+2]); };
+    auto dot = [&](int a, int b) { return m[a]*m[b] + m[a+1]*m[b+1] + m[a+2]*m[b+2]; };
+    for (int o : {0, 4, 8}) { float l = len(o); if (!(l > 0.97f && l < 1.03f)) return false; }
+    return fabsf(dot(0, 8)) < 0.05f && fabsf(dot(4, 8)) < 0.05f && fabsf(dot(0, 4)) < 0.05f;
+}
+// Devuelve la matriz de la camara (right@0, top@4, at@8, pos@12 en floats). Busca el puntero y lo valida.
+static bool ReadCamera(float* m) {
+    if (!pTheCamera) return false;
+    static int off = -1;
+    uintptr_t base = (uintptr_t)pTheCamera;
+    auto tryOff = [&](int o) {
+        uintptr_t p = 0;
+        if (!SafeRead((const void*)(base + o), &p, sizeof p)) return false;
+        if (p < 0x10000 || (p & 3)) return false;
+        if (!SafeRead((const void*)p, m, 64)) return false;
+        return BasisOK(m);
+    };
+    if (off >= 0) return tryOff(off);
+    for (int o = 8; o <= 0x58; o += 8) if (tryOff(o)) { off = o; LOG("matriz de camara encontrada en TheCamera+0x%x", o); return true; }
+    return false;
+}
+
+// =============================== SHADERS DE POST-PROCESO ===============================
+static const char* kVS = R"GLSL(
+attribute vec2 aPos; varying vec2 vUV;
+void main(){ vUV = aPos*0.5+0.5; gl_Position = vec4(aPos,0.0,1.0); }
+)GLSL";
+
+static const char* kFSBright = R"GLSL(
+precision mediump float;
+uniform sampler2D uTex; uniform float uThr; varying vec2 vUV;
+void main(){
+  vec3 c = texture2D(uTex, vUV).rgb;
+  float l = max(c.r, max(c.g, c.b));
+  float m = smoothstep(uThr, uThr + 0.22, l);
+  gl_FragColor = vec4(c * m, 1.0);
+}
+)GLSL";
+
+static const char* kFSRays = R"GLSL(
+precision mediump float;
+uniform sampler2D uTex; uniform vec2 uSun; uniform float uDens; varying vec2 vUV;
+void main(){
+  vec2 delta = (uSun - vUV) * uDens / 28.0;
+  vec2 uv = vUV; float w = 1.0; float ws = 0.0; vec3 acc = vec3(0.0);
+  for (int i = 0; i < 28; i++) {
+    uv += delta;
+    acc += texture2D(uTex, uv).rgb * w; ws += w; w *= 0.96;
+  }
+  gl_FragColor = vec4(acc / ws, 1.0);
+}
+)GLSL";
+
+static const char* kFSBlur = R"GLSL(
+precision mediump float;
+uniform sampler2D uTex; uniform vec2 uDir; varying vec2 vUV;
+void main(){
+  vec3 c = texture2D(uTex, vUV).rgb * 0.2270;
+  c += texture2D(uTex, vUV + uDir*1.3846).rgb * 0.3162;
+  c += texture2D(uTex, vUV - uDir*1.3846).rgb * 0.3162;
+  c += texture2D(uTex, vUV + uDir*3.2308).rgb * 0.0703;
+  c += texture2D(uTex, vUV - uDir*3.2308).rgb * 0.0703;
+  gl_FragColor = vec4(c, 1.0);
+}
+)GLSL";
+
+static const char* kFSFinal = R"GLSL(
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform sampler2D uScene; uniform sampler2D uRays; uniform sampler2D uBloom;
+uniform vec2 uSun;
+uniform vec4 uA;      // x=rayI  y=bloomI  z=flareI  w=rain
+uniform vec4 uB;      // x=time  y=aspect  z=saturation  w=contrast
+uniform vec3 uTint;
+varying vec2 vUV;
+
+float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+
+float rainLayer(vec2 uv, float scale, float speed, float slant){
+  vec2 p = vec2((uv.x + uv.y * slant) * scale * uB.y, uv.y * scale * 0.30 + uB.x * speed);
+  vec2 id = floor(p); vec2 f = fract(p);
+  float h = hash(id);
+  float present = step(0.80, h);
+  float cx = 0.25 + 0.5 * hash(id + 3.7);
+  float line = smoothstep(0.06, 0.0, abs(f.x - cx));
+  return present * line * pow(f.y, 4.0);
+}
+
+void main(){
+  vec3 scene = texture2D(uScene, vUV).rgb;
+  vec2 asp = vec2(uB.y, 1.0);
+  vec2 pc = (vUV - 0.5) * asp;
+  vec2 sc = (uSun - 0.5) * asp;
+
+  // god rays: se atenuan con la distancia al sol y no ciegan al mirarlo de frente
+  float dsun = length(pc - sc);
+  vec3 rays = texture2D(uRays, vUV).rgb;
+  rays = pow(rays, vec3(1.4)) * exp(-dsun * 2.0) * uA.x * uTint;
+  float centerDim = mix(0.45, 1.0, smoothstep(0.0, 0.35, length(sc)));
+  rays *= centerDim;
+
+  vec3 bloom = texture2D(uBloom, vUV).rgb * uA.y;
+
+  // flare: halo suave + 3 fantasmas sobre el eje sol-centro
+  float fl = exp(-dsun * 7.0) * 0.50;
+  fl += smoothstep(0.075, 0.020, length(pc + sc * 0.45)) * 0.16;
+  fl += smoothstep(0.110, 0.040, length(pc + sc * 0.85)) * 0.10;
+  fl += smoothstep(0.050, 0.015, length(pc + sc * 1.45)) * 0.14;
+  fl *= smoothstep(0.0, 0.25, length(sc)) * 0.6 + 0.4;
+  vec3 flare = fl * uA.z * vec3(1.0, 0.86, 0.66);
+
+  vec3 glow = min(rays + bloom + flare, vec3(0.70));
+  vec3 col = scene + (1.0 - scene) * glow;   // mezcla "screen": nunca se quema
+
+  if (uA.w > 0.002) {
+    float lum = dot(col, vec3(0.299, 0.587, 0.114));
+    col = mix(col, vec3(lum) * vec3(0.93, 0.97, 1.04), 0.20 * uA.w);
+    col *= 1.0 - 0.10 * uA.w;
+    float r = rainLayer(vUV, 60.0, 5.0, 0.18) * 0.55
+            + rainLayer(vUV, 110.0, 7.5, 0.20) * 0.40
+            + rainLayer(vUV, 190.0, 10.0, 0.22) * 0.30;
+    col += r * uA.w * vec3(0.72, 0.80, 0.90) * 0.55;
+  }
+
+  float l2 = dot(col, vec3(0.299, 0.587, 0.114));
+  col = mix(vec3(l2), col, uB.z);
+  col = (col - 0.5) * uB.w + 0.5;
+  gl_FragColor = vec4(col, 1.0);
+}
+)GLSL";
+
+// =============================== GL ===============================
+struct Prog { GLuint id = 0; GLint a = -1, b = -1, c = -1, d = -1, e = -1, f = -1, g = -1; };
+static Prog pBright, pRays, pBlur, pFinal;
+static GLuint tScene = 0, tBright = 0, tRays = 0, tBlurA = 0, tBlurB = 0, gFbo = 0;
+static int gW = 0, gH = 0, hW = 0, hH = 0, qW = 0, qH = 0;
+static bool gReady = false, gFailed = false;
+static const GLfloat kTri[6] = { -1.f, -1.f, 3.f, -1.f, -1.f, 3.f };
 
 static GLuint Compile(GLenum type, const char* src) {
     GLuint s = glCreateShader(type);
-    glShaderSource(s, 1, &src, nullptr);
-    glCompileShader(s);
+    glShaderSource(s, 1, &src, nullptr); glCompileShader(s);
     GLint ok = 0; glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
     if (!ok) { char b[512]; glGetShaderInfoLog(s, sizeof b, nullptr, b); LOG("shader error: %s", b); return 0; }
     return s;
 }
-static GLuint MakeProgram(const char* vs, const char* fs) {
+static GLuint Link(const char* vs, const char* fs) {
     GLuint v = Compile(GL_VERTEX_SHADER, vs), f = Compile(GL_FRAGMENT_SHADER, fs);
     if (!v || !f) return 0;
     GLuint p = glCreateProgram();
-    glAttachShader(p, v); glAttachShader(p, f);
-    glBindAttribLocation(p, 0, "aPos");
-    glLinkProgram(p);
+    glAttachShader(p, v); glAttachShader(p, f); glBindAttribLocation(p, 0, "aPos"); glLinkProgram(p);
     GLint ok = 0; glGetProgramiv(p, GL_LINK_STATUS, &ok);
     if (!ok) { char b[512]; glGetProgramInfoLog(p, sizeof b, nullptr, b); LOG("link error: %s", b); return 0; }
     return p;
 }
-
 static void MakeTex(GLuint& t, GLenum fmt, int w, int h) {
     if (!t) glGenTextures(1, &t);
     glBindTexture(GL_TEXTURE_2D, t);
@@ -90,43 +278,49 @@ static void MakeTex(GLuint& t, GLenum fmt, int w, int h) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 }
-
+static void Target(GLuint tex, int w, int h) {
+    glBindFramebuffer(GL_FRAMEBUFFER, gFbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    glViewport(0, 0, w, h);
+}
 static bool InitGL(int w, int h) {
-    if (!g_progRays) {
-        g_progRays = MakeProgram(kVS, kFSRays);
-        g_progComp = MakeProgram(kVS, kFSComp);
-        if (!g_progRays || !g_progComp) return false;
-        uR_scene = glGetUniformLocation(g_progRays, "uScene");
-        uR_sun   = glGetUniformLocation(g_progRays, "uSun");
-        uR_dens  = glGetUniformLocation(g_progRays, "uDens");
-        uR_thr   = glGetUniformLocation(g_progRays, "uThr");
-        uC_tex   = glGetUniformLocation(g_progComp, "uTex");
-        uC_int   = glGetUniformLocation(g_progComp, "uInt");
-        uC_tint  = glGetUniformLocation(g_progComp, "uTint");
-        glGenFramebuffers(1, &g_halfFbo);
+    if (!pBright.id) {
+        pBright.id = Link(kVS, kFSBright); pRays.id = Link(kVS, kFSRays);
+        pBlur.id = Link(kVS, kFSBlur);     pFinal.id = Link(kVS, kFSFinal);
+        if (!pBright.id || !pRays.id || !pBlur.id || !pFinal.id) return false;
+        pBright.a = glGetUniformLocation(pBright.id, "uTex"); pBright.b = glGetUniformLocation(pBright.id, "uThr");
+        pRays.a = glGetUniformLocation(pRays.id, "uTex"); pRays.b = glGetUniformLocation(pRays.id, "uSun"); pRays.c = glGetUniformLocation(pRays.id, "uDens");
+        pBlur.a = glGetUniformLocation(pBlur.id, "uTex"); pBlur.b = glGetUniformLocation(pBlur.id, "uDir");
+        pFinal.a = glGetUniformLocation(pFinal.id, "uScene"); pFinal.b = glGetUniformLocation(pFinal.id, "uRays");
+        pFinal.c = glGetUniformLocation(pFinal.id, "uBloom"); pFinal.d = glGetUniformLocation(pFinal.id, "uSun");
+        pFinal.e = glGetUniformLocation(pFinal.id, "uA");     pFinal.f = glGetUniformLocation(pFinal.id, "uB");
+        pFinal.g = glGetUniformLocation(pFinal.id, "uTint");
+        glGenFramebuffers(1, &gFbo);
     }
-    g_w = w; g_h = h; g_hw = w / kHalfDiv; g_hh = h / kHalfDiv;
-    MakeTex(g_sceneTex, GL_RGB,  g_w,  g_h);
-    MakeTex(g_halfTex,  GL_RGBA, g_hw, g_hh);
-    glBindFramebuffer(GL_FRAMEBUFFER, g_halfFbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_halfTex, 0);
-    bool ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
-    if (!ok) LOG("FBO incompleto");
-    return ok;
+    gW = w; gH = h; hW = w / 2; hH = h / 2; qW = w / 4; qH = h / 4;
+    MakeTex(tScene, GL_RGB, gW, gH);
+    MakeTex(tBright, GL_RGBA, hW, hH); MakeTex(tRays, GL_RGBA, hW, hH);
+    MakeTex(tBlurA, GL_RGBA, qW, qH);  MakeTex(tBlurB, GL_RGBA, qW, qH);
+    GLuint ts[4] = { tBright, tRays, tBlurA, tBlurB };
+    for (GLuint t : ts) {
+        Target(t, 16, 16);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) { LOG("FBO incompleto"); return false; }
+    }
+    return true;
 }
 
 struct GLState {
-    GLint prog, fbo, tex, activeTex, arrayBuf, vp[4];
+    GLint prog, fbo, tex[3], activeTex, arrayBuf, vp[4];
     GLint a0en, a0size, a0type, a0norm, a0stride, a0buf; void* a0ptr;
-    GLint blendSrcRGB, blendDstRGB, blendSrcA, blendDstA;
+    GLint bSrcRGB, bDstRGB, bSrcA, bDstA;
     GLboolean blend, depth, cull, scissor, stencil, depthMask, colorMask[4];
 };
 static void Save(GLState& s) {
     glGetIntegerv(GL_CURRENT_PROGRAM, &s.prog);
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &s.fbo);
     glGetIntegerv(GL_ACTIVE_TEXTURE, &s.activeTex);
+    for (int i = 0; i < 3; i++) { glActiveTexture(GL_TEXTURE0 + i); glGetIntegerv(GL_TEXTURE_BINDING_2D, &s.tex[i]); }
     glActiveTexture(GL_TEXTURE0);
-    glGetIntegerv(GL_TEXTURE_BINDING_2D, &s.tex);
     glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &s.arrayBuf);
     glGetIntegerv(GL_VIEWPORT, s.vp);
     glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &s.a0en);
@@ -136,11 +330,10 @@ static void Save(GLState& s) {
     glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &s.a0stride);
     glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &s.a0buf);
     glGetVertexAttribPointerv(0, GL_VERTEX_ATTRIB_ARRAY_POINTER, &s.a0ptr);
-    glGetIntegerv(GL_BLEND_SRC_RGB, &s.blendSrcRGB);   glGetIntegerv(GL_BLEND_DST_RGB, &s.blendDstRGB);
-    glGetIntegerv(GL_BLEND_SRC_ALPHA, &s.blendSrcA);   glGetIntegerv(GL_BLEND_DST_ALPHA, &s.blendDstA);
-    s.blend = glIsEnabled(GL_BLEND); s.depth = glIsEnabled(GL_DEPTH_TEST);
-    s.cull = glIsEnabled(GL_CULL_FACE); s.scissor = glIsEnabled(GL_SCISSOR_TEST);
-    s.stencil = glIsEnabled(GL_STENCIL_TEST);
+    glGetIntegerv(GL_BLEND_SRC_RGB, &s.bSrcRGB); glGetIntegerv(GL_BLEND_DST_RGB, &s.bDstRGB);
+    glGetIntegerv(GL_BLEND_SRC_ALPHA, &s.bSrcA); glGetIntegerv(GL_BLEND_DST_ALPHA, &s.bDstA);
+    s.blend = glIsEnabled(GL_BLEND); s.depth = glIsEnabled(GL_DEPTH_TEST); s.cull = glIsEnabled(GL_CULL_FACE);
+    s.scissor = glIsEnabled(GL_SCISSOR_TEST); s.stencil = glIsEnabled(GL_STENCIL_TEST);
     glGetBooleanv(GL_DEPTH_WRITEMASK, &s.depthMask); glGetBooleanv(GL_COLOR_WRITEMASK, s.colorMask);
 }
 static void Restore(const GLState& s) {
@@ -151,112 +344,295 @@ static void Restore(const GLState& s) {
     glBindFramebuffer(GL_FRAMEBUFFER, s.fbo);
     glViewport(s.vp[0], s.vp[1], s.vp[2], s.vp[3]);
     glUseProgram(s.prog);
-    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, s.tex);
+    for (int i = 0; i < 3; i++) { glActiveTexture(GL_TEXTURE0 + i); glBindTexture(GL_TEXTURE_2D, s.tex[i]); }
     glActiveTexture(s.activeTex);
-    glBlendFuncSeparate(s.blendSrcRGB, s.blendDstRGB, s.blendSrcA, s.blendDstA);
-    auto set = [](GLenum cap, GLboolean on){ if (on) glEnable(cap); else glDisable(cap); };
+    glBlendFuncSeparate(s.bSrcRGB, s.bDstRGB, s.bSrcA, s.bDstA);
+    auto set = [](GLenum cap, GLboolean on) { if (on) glEnable(cap); else glDisable(cap); };
     set(GL_BLEND, s.blend); set(GL_DEPTH_TEST, s.depth); set(GL_CULL_FACE, s.cull);
     set(GL_SCISSOR_TEST, s.scissor); set(GL_STENCIL_TEST, s.stencil);
     glDepthMask(s.depthMask); glColorMask(s.colorMask[0], s.colorMask[1], s.colorMask[2], s.colorMask[3]);
 }
-
 static void DrawTri() {
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, kTri);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 }
-
-static void GetScreenSize(int& w, int& h) {
+static void ScreenSize(int& w, int& h) {
     EGLDisplay d = eglGetCurrentDisplay(); EGLSurface s = eglGetCurrentSurface(EGL_DRAW);
     w = h = 0;
     if (d != EGL_NO_DISPLAY && s != EGL_NO_SURFACE) { eglQuerySurface(d, s, EGL_WIDTH, &w); eglQuerySurface(d, s, EGL_HEIGHT, &h); }
     if (w <= 0 || h <= 0) { GLint vp[4]; glGetIntegerv(GL_VIEWPORT, vp); w = vp[2]; h = vp[3]; }
 }
 
-static void RenderRays() {
-    int w, h; GetScreenSize(w, h);
+// =============================== PROGRAMAS DEL JUEGO (uniformes SAFX_*) ===============================
+struct GameProg { GLuint id; GLint l0, l1, l2; };
+static GameProg gProgs[160]; static int gNProgs = 0;
+static void RescanPrograms() {
+    for (GLuint p = 1; p <= 3000 && gNProgs < 160; p++) {
+        if (!glIsProgram(p)) continue;
+        bool known = false;
+        for (int i = 0; i < gNProgs; i++) if (gProgs[i].id == p) { known = true; break; }
+        if (known) continue;
+        GLint l0 = glGetUniformLocation(p, "SAFX_P0"), l1 = glGetUniformLocation(p, "SAFX_P1"), l2 = glGetUniformLocation(p, "SAFX_P2");
+        if (l0 >= 0 || l1 >= 0 || l2 >= 0) gProgs[gNProgs++] = { p, l0, l1, l2 };
+    }
+    while (glGetError() != GL_NO_ERROR) {}
+}
+
+// =============================== ESTADO POR FRAME ===============================
+struct Frame { float t, windX, windY, windAmp, sunX, sunY, sunZ, sunUp; } F;
+static void UpdateFrameState() {
+    F.t = (float)fmod(NowSec(), 6283.0);
+    float ws = pWind ? fminf(fmaxf(*pWind, 0.f), 1.5f) : 0.3f;
+    float wx = 1.f, wy = 0.3f;
+    if (pWindDir) { wx = pWindDir[0]; wy = pWindDir[1]; }
+    float wl = sqrtf(wx * wx + wy * wy);
+    if (wl < 0.01f) { wx = 1.f; wy = 0.3f; wl = sqrtf(wx * wx + wy * wy); }
+    F.windX = wx / wl; F.windY = wy / wl;
+    F.windAmp = C.treeSway * (0.5f + ws);
+    const float* v = pVecToSun + ((*pCurStored) & 15) * 3;
+    F.sunX = v[0]; F.sunY = v[1]; F.sunZ = v[2];
+    F.sunUp = clamp01(v[2] * 3.0f);
+}
+static void UploadGameUniforms() {
+    for (int i = 0; i < gNProgs; i++) {
+        GameProg& g = gProgs[i];
+        if (!glIsProgram(g.id)) continue;
+        glUseProgram(g.id);
+        if (g.l0 >= 0) glUniform4f(g.l0, F.t, F.windX, F.windY, F.windAmp);
+        if (g.l1 >= 0) glUniform4f(g.l1, F.sunX, F.sunY, F.sunZ, C.waterSpec * F.sunUp);
+        if (g.l2 >= 0) glUniform4f(g.l2, 1.0f, 0.94f, 0.82f, C.waterFres);
+    }
+}
+
+// =============================== EFECTOS EN PANTALLA ===============================
+static void RunFX() {
+    int w, h; ScreenSize(w, h);
     if (w < 64 || h < 64) return;
+    static int frame = 0; frame++;
+    UpdateFrameState();
 
-    const float* v = g_vecToSun + (*g_curStored & 15) * 3;
-    float sunUp = fminf(fmaxf(v[2] * 3.0f, 0.0f), 1.0f);
-    float blocked = *g_sunBlocked ? 0.0f : 1.0f;
+    // posicion del sol en pantalla
+    float u = 0.5f, v = 0.5f, vis = 0.f;
+    float cam[16]; bool camOK = ReadCamera(cam);
+    float gu = *pSunX / (float)w, gv = 1.0f - (*pSunY / (float)h);
+    bool front = false;
+    if (camOK) {
+        float facing = cam[8] * F.sunX + cam[9] * F.sunY + cam[10] * F.sunZ;
+        if (CalcScreen) {
+            float world[3] = { cam[12] + F.sunX * 100.f, cam[13] + F.sunY * 100.f, cam[14] + F.sunZ * 100.f };
+            float out[3] = {0, 0, 0}, sw = 0, sh = 0;
+            front = CalcScreen(world, out, &sw, &sh, false, false);
+            if (front) { u = out[0] / (float)w; v = 1.0f - out[1] / (float)h; vis = 1.f; }
+        } else if (facing > 0.1f) { u = gu; v = gv; vis = smooth(0.1f, 0.3f, facing); }
+    } else { u = gu; v = gv; vis = 1.f; }
+    if (!(fabsf(u) < 4.f && fabsf(v) < 4.f)) vis = 0.f;
 
-    float u = *g_sunScrX / (float)w, vv = 1.0f - (*g_sunScrY / (float)h);
+    if ((frame % 300) == 1)
+        LOG("camOK=%d front=%d sunUV=(%.2f,%.2f) gameUV=(%.2f,%.2f) sunUp=%.2f rain=%.2f wind=%.2f progs=%d agua=%d viento=%d fallos=%d",
+            camOK, front, u, v, gu, gv, F.sunUp, pRain ? *pRain : -1.f, pWind ? *pWind : -1.f, gNProgs, g_nWater, g_nWind, g_nPatchFail);
 
-    static int frame = 0;
-    if ((frame++ % 300) == 0)
-        LOG("sun scr=(%.1f,%.1f) uv=(%.2f,%.2f) vec=(%.2f,%.2f,%.2f) idx=%d blocked=%d screen=%dx%d",
-            *g_sunScrX, *g_sunScrY, u, vv, v[0], v[1], v[2], *g_curStored, (int)*g_sunBlocked, w, h);
+    float ex = fmaxf(fmaxf(-u, u - 1.f), 0.f), ey = fmaxf(fmaxf(-v, v - 1.f), 0.f);
+    float edge = 1.f - smooth(0.f, 0.45f, fmaxf(ex, ey));
+    float blockedK = *pSunBlocked ? 1.f : 0.f;
+    float rayK   = C.godRays > 0.5f ? C.rayInt * F.sunUp * vis * edge * (1.f - 0.65f * blockedK) : 0.f;
+    float flareK = C.flare   > 0.5f ? C.flareInt * F.sunUp * vis * edge * (1.f - 0.80f * blockedK) : 0.f;
+    float bloomK = C.bloom   > 0.5f ? C.bloomInt : 0.f;
+    float rainK  = 0.f;
+    if (C.rain > 0.5f && pRain) {
+        rainK = clamp01(*pRain) * C.rainInt;
+        if (pTunnel) rainK *= 1.f - clamp01(*pTunnel);
+        if (pUnder)  rainK *= 1.f - clamp01(*pUnder);
+    }
+    bool needGrade = fabsf(C.sat - 1.f) > 0.01f || fabsf(C.contrast - 1.f) > 0.01f;
+    bool anyFX = rayK > 0.005f || flareK > 0.005f || bloomK > 0.005f || rainK > 0.005f || needGrade;
 
-    float ex = fmaxf(fmaxf(-u, u - 1.0f), 0.0f), ey = fmaxf(fmaxf(-vv, vv - 1.0f), 0.0f);
-    float edge = 1.0f - fminf(fmaxf((ex > ey ? ex : ey) / 0.3f, 0.0f), 1.0f);
-    float k = kRayIntensity * sunUp * blocked * edge;
-    if (k < 0.01f) return;
-
-    if (!g_glReady || w != g_w || h != g_h) {
-        GLState st0; Save(st0);
-        g_glReady = InitGL(w, h);
-        Restore(st0);
-        if (!g_glReady) { g_glFailed = true; return; }
+    if (!gReady || w != gW || h != gH) {
+        GLState s0; Save(s0);
+        gReady = InitGL(w, h);
+        Restore(s0);
+        if (!gReady) { gFailed = true; return; }
+    }
+    if (frame < 600 ? (frame % 30) == 0 : (frame % 300) == 0) {
+        GLState sr; Save(sr); RescanPrograms(); Restore(sr);
     }
 
     GLState st; Save(st);
+    UploadGameUniforms();
 
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, g_sceneTex);
-    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, w, h);
+    if (anyFX) {
+        glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE); glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_STENCIL_TEST); glDisable(GL_BLEND);
+        glDepthMask(GL_FALSE); glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
-    glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE); glDisable(GL_SCISSOR_TEST);
-    glDisable(GL_STENCIL_TEST); glDisable(GL_BLEND);
-    glDepthMask(GL_FALSE); glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        // 1) copiar escena
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tScene);
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, w, h);
 
-    glBindFramebuffer(GL_FRAMEBUFFER, g_halfFbo);
-    glViewport(0, 0, g_hw, g_hh);
-    glUseProgram(g_progRays);
-    glUniform1i(uR_scene, 0);
-    glUniform2f(uR_sun, u, vv);
-    glUniform1f(uR_dens, kRayDensity);
-    glUniform1f(uR_thr, kThreshold);
-    DrawTri();
-
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, w, h);
-    glBindTexture(GL_TEXTURE_2D, g_halfTex);
-    glEnable(GL_BLEND); glBlendFunc(GL_ONE, GL_ONE);
-    glUseProgram(g_progComp);
-    glUniform1i(uC_tex, 0);
-    glUniform1f(uC_int, k);
-    glUniform3f(uC_tint, kTint[0], kTint[1], kTint[2]);
-    DrawTri();
-
+        // 2) zonas brillantes (mitad de resolucion)
+        if (rayK > 0.005f || bloomK > 0.005f) {
+            Target(tBright, hW, hH);
+            glUseProgram(pBright.id); glUniform1i(pBright.a, 0);
+            glUniform1f(pBright.b, fminf(C.rayThr, C.bloomThr));
+            glBindTexture(GL_TEXTURE_2D, tScene); DrawTri();
+        }
+        // 3) barrido radial hacia el sol
+        if (rayK > 0.005f) {
+            Target(tRays, hW, hH);
+            glUseProgram(pRays.id); glUniform1i(pRays.a, 0);
+            glUniform2f(pRays.b, u, v); glUniform1f(pRays.c, C.rayDens);
+            glBindTexture(GL_TEXTURE_2D, tBright); DrawTri();
+        }
+        // 4) bloom: desenfoque horizontal y vertical (cuarto de resolucion)
+        if (bloomK > 0.005f) {
+            glUseProgram(pBlur.id); glUniform1i(pBlur.a, 0);
+            Target(tBlurA, qW, qH); glUniform2f(pBlur.b, 1.f / hW, 0.f);
+            glBindTexture(GL_TEXTURE_2D, tBright); DrawTri();
+            Target(tBlurB, qW, qH); glUniform2f(pBlur.b, 0.f, 1.f / qH);
+            glBindTexture(GL_TEXTURE_2D, tBlurA); DrawTri();
+        }
+        // 5) composicion final a pantalla
+        glBindFramebuffer(GL_FRAMEBUFFER, 0); glViewport(0, 0, w, h);
+        glUseProgram(pFinal.id);
+        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tScene);
+        glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, tRays);
+        glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, tBlurB);
+        glUniform1i(pFinal.a, 0); glUniform1i(pFinal.b, 1); glUniform1i(pFinal.c, 2);
+        glUniform2f(pFinal.d, u, v);
+        glUniform4f(pFinal.e, rayK, bloomK, flareK, rainK);
+        glUniform4f(pFinal.f, F.t, (float)w / (float)h, C.sat, C.contrast);
+        glUniform3f(pFinal.g, C.tintR, C.tintG, C.tintB);
+        DrawTri();
+    }
     Restore(st);
     while (glGetError() != GL_NO_ERROR) {}
 }
 
-static void RQ_Swap_hook(char*& cmd) {
-    if (!g_glFailed) RenderRays();
-    RQ_Swap_orig(cmd);
+static void Swap_hook(char*& cmd) {
+    if (!gFailed) RunFX();
+    Swap_orig(cmd);
 }
 
-ON_MOD_PRELOAD() { LOG("SAFX preload"); }
+// =============================== PARCHES DE SHADERS DEL JUEGO ===============================
+static bool TestCompile(const char* vs, const char* fs) {
+    GLuint v = glCreateShader(GL_VERTEX_SHADER); if (!v) return false;
+    GLuint f = glCreateShader(GL_FRAGMENT_SHADER);
+    GLuint p = glCreateProgram();
+    GLint ok = 0, ok2 = 0, ok3 = 0;
+    glShaderSource(v, 1, &vs, nullptr); glCompileShader(v); glGetShaderiv(v, GL_COMPILE_STATUS, &ok);
+    glShaderSource(f, 1, &fs, nullptr); glCompileShader(f); glGetShaderiv(f, GL_COMPILE_STATUS, &ok2);
+    if (ok && ok2) { glAttachShader(p, v); glAttachShader(p, f); glLinkProgram(p); glGetProgramiv(p, GL_LINK_STATUS, &ok3); }
+    glDeleteProgram(p); glDeleteShader(v); glDeleteShader(f);
+    while (glGetError() != GL_NO_ERROR) {}
+    return ok && ok2 && ok3;
+}
+static bool InsertAfter(std::string& s, const char* anchor, const char* text) {
+    size_t p = s.find(anchor); if (p == std::string::npos) return false;
+    s.insert(p + strlen(anchor), text); return true;
+}
+static bool InsertBeforeMain(std::string& s, const char* text) {
+    size_t p = s.find("void main"); if (p == std::string::npos) return false;
+    s.insert(p, text); return true;
+}
+
+static const char* kWorldPosAnchor = "vec4 WorldPos = ObjMatrix * vec4(Position,1.0);";
+
+static bool PatchWater(std::string& vs, std::string& fs) {
+    if (fs.find("FogColor") == std::string::npos || vs.find("CameraPosition") == std::string::npos) return false;
+    if (!InsertBeforeMain(vs, "varying mediump vec3 SAFX_View;\n")) return false;
+    if (!InsertAfter(vs, kWorldPosAnchor, "\n\tSAFX_View = WorldPos.xyz - CameraPosition.xyz;\n")) return false;
+    if (!InsertBeforeMain(fs, "varying mediump vec3 SAFX_View;\nuniform mediump vec4 SAFX_P1;\nuniform mediump vec4 SAFX_P2;\n")) return false;
+    const char* code = R"GLSL(
+{
+  vec3 SAFX_V = normalize(SAFX_View);
+  float SAFX_e = 0.006;
+  vec2 SAFX_g = vec2(
+    texture2D(EnvMap, Out_WaterDetail + vec2(SAFX_e, 0.0), -1.0).x - texture2D(EnvMap, Out_WaterDetail - vec2(SAFX_e, 0.0), -1.0).x,
+    texture2D(EnvMap, Out_WaterDetail2 + vec2(0.0, SAFX_e), -1.0).x - texture2D(EnvMap, Out_WaterDetail2 - vec2(0.0, SAFX_e), -1.0).x);
+  vec3 SAFX_N = normalize(vec3(SAFX_g * 3.0, 1.0));
+  float SAFX_c = clamp(dot(-SAFX_V, SAFX_N), 0.0, 1.0);
+  float SAFX_F = 0.02 + 0.98 * pow(1.0 - SAFX_c, 5.0);
+  vec3 SAFX_R = reflect(SAFX_V, SAFX_N);
+  vec3 SAFX_sky = mix(FogColor, FogColor * 1.25 + vec3(0.04, 0.07, 0.12), clamp(SAFX_R.z * 1.5, 0.0, 1.0));
+  float SAFX_d = max(dot(SAFX_R, SAFX_P1.xyz), 0.0);
+  float SAFX_sp = pow(SAFX_d, 140.0) * 1.6 + pow(SAFX_d, 22.0) * 0.12;
+  fcolor.xyz = mix(fcolor.xyz, SAFX_sky, SAFX_F * SAFX_P2.w) + SAFX_P2.xyz * SAFX_sp * SAFX_P1.w;
+}
+)GLSL";
+    return InsertAfter(fs, "waterDetail * 1.1, Out_Color.w);", code);
+}
+
+static bool PatchWind(std::string& vs) {
+    if (!InsertBeforeMain(vs, "uniform highp vec4 SAFX_P0;\n")) return false;
+    const char* code = R"GLSL(
+
+  float SAFX_h = smoothstep(1.0, 12.0, Position.z);
+  float SAFX_s = sin(WorldPos.x * 0.07 + SAFX_P0.x * 1.7) + sin(WorldPos.y * 0.05 + SAFX_P0.x * 1.1 + 1.3) * 0.7 + 1.2;
+  WorldPos.xy += SAFX_P0.yz * (SAFX_s * 0.35) * SAFX_P0.w * SAFX_h;
+)GLSL";
+    return InsertAfter(vs, kWorldPosAnchor, code);
+}
+
+static uint64_t Build_hook(void* self, const char* vs, const char* fs) {
+    if (vs && fs && (C.water > 0.5f || C.wind > 0.5f)) {
+        std::string v(vs), f(fs);
+        bool water = f.find("Out_WaterDetail") != std::string::npos && v.find("Out_WaterDetail") != std::string::npos;
+        bool foliage = !water && v.find("BoneToLocal") == std::string::npos && v.find(kWorldPosAnchor) != std::string::npos
+                       && f.find("discard") != std::string::npos && f.find("EnvMapCoefficient") == std::string::npos;
+        bool changed = false;
+        if (water && C.water > 0.5f) changed = PatchWater(v, f);
+        else if (foliage && C.wind > 0.5f) changed = PatchWind(v);
+        if (changed) {
+            if (TestCompile(v.c_str(), f.c_str())) {
+                if (water) g_nWater++; else g_nWind++;
+                return Build_orig(self, strdup(v.c_str()), strdup(f.c_str()));
+            }
+            g_nPatchFail++;
+        }
+    }
+    return Build_orig(self, vs, fs);
+}
+
+// Viento en pasto/plantas: amplifica la inclinacion que calcula el juego
+static void Wind_hook(float v) {
+    float gust = 0.04f * sinf((float)fmod(NowSec(), 6283.0) * 1.3f);
+    Wind_orig(v * C.grassGain + gust);
+}
+
+// =============================== CARGA DEL MOD ===============================
+ON_MOD_PRELOAD() { LOG("SAFX 0.2 preload"); }
 
 ON_MOD_LOAD() {
+    LoadConfig();
     void* h = (void*)aml->GetLibHandle("libGTASA.so");
     if (!h) { LOG("no se encontro libGTASA.so"); return; }
+    auto sym = [&](const char* n) { return (void*)aml->GetSym(h, n); };
 
-    g_curStored  = (int*)  aml->GetSym(h, "_ZN10CTimeCycle20m_CurrentStoredValueE");
-    g_vecToSun   = (float*)aml->GetSym(h, "_ZN10CTimeCycle13m_VectorToSunE");
-    g_sunScrX    = (float*)aml->GetSym(h, "_ZN8CCoronas10SunScreenXE");
-    g_sunScrY    = (float*)aml->GetSym(h, "_ZN8CCoronas10SunScreenYE");
-    g_sunBlocked = (bool*) aml->GetSym(h, "_ZN8CCoronas18SunBlockedByCloudsE");
-    void* swap   = (void*) aml->GetSym(h, "_Z24RQ_Command_rqSwapBuffersRPc");
+    pCurStored  = (int*)  sym("_ZN10CTimeCycle20m_CurrentStoredValueE");
+    pVecToSun   = (float*)sym("_ZN10CTimeCycle13m_VectorToSunE");
+    pSunX       = (float*)sym("_ZN8CCoronas10SunScreenXE");
+    pSunY       = (float*)sym("_ZN8CCoronas10SunScreenYE");
+    pSunBlocked = (bool*) sym("_ZN8CCoronas18SunBlockedByCloudsE");
+    pRain       = (float*)sym("_ZN8CWeather4RainE");
+    pWind       = (float*)sym("_ZN8CWeather4WindE");
+    pWindDir    = (float*)sym("_ZN8CWeather7WindDirE");
+    pTunnel     = (float*)sym("_ZN8CWeather12InTunnelnessE");
+    pUnder      = (float*)sym("_ZN8CWeather14UnderWaternessE");
+    pTheCamera  =         sym("TheCamera");
+    CalcScreen  = (CalcScreenFn)sym("_ZN7CSprite15CalcScreenCoorsERK5RwV3dPS0_PfS4_bb");
 
-    if (!g_curStored || !g_vecToSun || !g_sunScrX || !g_sunScrY || !g_sunBlocked || !swap) {
-        LOG("faltan simbolos, plugin desactivado");
+    void* swap  = sym("_Z24RQ_Command_rqSwapBuffersRPc");
+    void* build = sym("_ZN9ES2Shader5BuildEPKcS1_");
+    void* wind  = sym("_ZN14CGrassRenderer20SetGlobalWindBendingEf");
+
+    if (!pCurStored || !pVecToSun || !pSunX || !pSunY || !pSunBlocked || !swap) {
+        LOG("faltan simbolos base, plugin desactivado");
         return;
     }
-    aml->Hook(swap, (void*)RQ_Swap_hook, (void**)&RQ_Swap_orig);
-    LOG("SAFX activo: hook en RQ_Command_rqSwapBuffers");
+    aml->Hook(swap, (void*)Swap_hook, (void**)&Swap_orig);
+    if (build) aml->Hook(build, (void*)Build_hook, (void**)&Build_orig); else LOG("sin ES2Shader::Build: agua/arboles desactivados");
+    if (wind && C.wind > 0.5f) aml->Hook(wind, (void*)Wind_hook, (void**)&Wind_orig);
+    LOG("SAFX activo (rain=%p wind=%p camera=%p calc=%p build=%p grass=%p)", pRain, pWind, pTheCamera, (void*)CalcScreen, build, wind);
 }
