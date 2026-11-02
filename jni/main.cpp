@@ -407,6 +407,182 @@ static void UploadGameUniforms() {
 }
 
 // =============================== EFECTOS EN PANTALLA ===============================
+static float* pHeat = nullptr; static float* pWetRoads = nullptr;
+
+struct Cfg2 {
+    float exposure = 1.0f, tonemap = 0.35f, gamma = 1.0f, wb = 0.02f;
+    float vignette = 0.25f, grain = 0.03f, chroma = 0.0015f, sharpen = 0.25f;
+    float fxaa = 1, heat = 1, wet = 0.5f;
+    float stR = 0.00f, stG = 0.02f, stB = 0.05f, htR = 0.05f, htG = 0.03f, htB = 0.00f;
+} D;
+static KV kKeys2[] = {
+    {"Exposure",&D.exposure},{"Tonemap",&D.tonemap},{"Gamma",&D.gamma},{"WhiteBalance",&D.wb},
+    {"Vignette",&D.vignette},{"FilmGrain",&D.grain},{"ChromaticAberration",&D.chroma},{"Sharpen",&D.sharpen},
+    {"FXAA",&D.fxaa},{"HeatHaze",&D.heat},{"WetSheen",&D.wet},
+    {"ShadowTintR",&D.stR},{"ShadowTintG",&D.stG},{"ShadowTintB",&D.stB},
+    {"HighlightTintR",&D.htR},{"HighlightTintG",&D.htG},{"HighlightTintB",&D.htB},
+};
+static void LoadConfig2() {
+    char pkg[128] = "com.rockstargames.gtasa";
+    FILE* c = fopen("/proc/self/cmdline", "r");
+    if (c) { char b[128] = {0}; if (fgets(b, sizeof b, c) && b[0]) snprintf(pkg, sizeof pkg, "%s", b); fclose(c); }
+    char path[256];
+    snprintf(path, sizeof path, "/storage/emulated/0/Android/data/%s/SAFX.ini", pkg);
+    bool seenNew = false;
+    FILE* f = fopen(path, "r");
+    if (f) {
+        char line[160];
+        while (fgets(line, sizeof line, f)) {
+            if (line[0] == '#' || line[0] == ';' || line[0] == '[') continue;
+            char* eq = strchr(line, '='); if (!eq) continue;
+            *eq = 0; char* key = line; char* val = eq + 1;
+            while (*key == ' ') key++;
+            for (char* e = key + strlen(key); e > key && (e[-1] == ' ' || e[-1] == '\t'); ) *--e = 0;
+            for (auto& kv : kKeys2) if (!strcmp(kv.k, key)) { *kv.v = (float)atof(val); seenNew = true; }
+        }
+        fclose(f);
+    }
+    if (!seenNew) {
+        FILE* o = fopen(path, "a");
+        if (o) {
+            fprintf(o, "\n# --- SAFX 0.3: correccion de imagen y postproceso ---\n");
+            for (auto& kv : kKeys2) fprintf(o, "%s=%.4f\n", kv.k, *kv.v);
+            fclose(o); LOG("claves nuevas agregadas a %s", path);
+        }
+    }
+}
+
+static const char* kFSFinal2 = R"GLSL(
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform sampler2D uScene; uniform sampler2D uRays; uniform sampler2D uBloom;
+uniform vec2 uSun;
+uniform vec4 uA;   // x=rayI y=bloomI z=flareI w=rain
+uniform vec4 uB;   // x=time y=aspect z=saturation w=contrast
+uniform vec3 uTint;
+uniform vec4 uC;   // x=exposure y=tonemap z=gamma w=temperatura
+uniform vec4 uD;   // x=vineta y=grano z=aberracion w=sharpen
+uniform vec4 uE;   // x=heat y=mojado z=fxaa
+uniform vec4 uF;   // xy = tamano de texel
+uniform vec3 uG;   // tinte sombras
+uniform vec3 uH;   // tinte luces
+varying vec2 vUV;
+
+const vec3 LUMA = vec3(0.299, 0.587, 0.114);
+
+float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+float vnoise(vec2 p){
+  vec2 i = floor(p); vec2 f = fract(p); f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash(i), hash(i + vec2(1.0, 0.0)), f.x), mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), f.x), f.y);
+}
+float rainLayer(vec2 uv, float scale, float speed, float slant){
+  vec2 p = vec2((uv.x + uv.y * slant) * scale * uB.y, uv.y * scale * 0.30 + uB.x * speed);
+  vec2 id = floor(p); vec2 f = fract(p);
+  float h = hash(id);
+  float present = step(0.80, h);
+  float cx = 0.25 + 0.5 * hash(id + 3.7);
+  float line = smoothstep(0.06, 0.0, abs(f.x - cx));
+  return present * line * pow(f.y, 4.0);
+}
+vec3 aces(vec3 x){ return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); }
+
+vec3 fxaa(vec2 uv){
+  vec2 px = uF.xy;
+  vec3 rgbNW = texture2D(uScene, uv + vec2(-1.0, -1.0) * px).rgb;
+  vec3 rgbNE = texture2D(uScene, uv + vec2( 1.0, -1.0) * px).rgb;
+  vec3 rgbSW = texture2D(uScene, uv + vec2(-1.0,  1.0) * px).rgb;
+  vec3 rgbSE = texture2D(uScene, uv + vec2( 1.0,  1.0) * px).rgb;
+  vec3 rgbM  = texture2D(uScene, uv).rgb;
+  float lNW = dot(rgbNW, LUMA), lNE = dot(rgbNE, LUMA), lSW = dot(rgbSW, LUMA), lSE = dot(rgbSE, LUMA), lM = dot(rgbM, LUMA);
+  float lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE)));
+  float lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));
+  vec2 dir;
+  dir.x = -((lNW + lNE) - (lSW + lSE));
+  dir.y =  ((lNW + lSW) - (lNE + lSE));
+  float dirReduce = max((lNW + lNE + lSW + lSE) * 0.03125, 0.0078125);
+  float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
+  dir = min(vec2(8.0), max(vec2(-8.0), dir * rcpDirMin)) * px;
+  vec3 rgbA = 0.5 * (texture2D(uScene, uv + dir * (1.0 / 3.0 - 0.5)).rgb + texture2D(uScene, uv + dir * (2.0 / 3.0 - 0.5)).rgb);
+  vec3 rgbB = rgbA * 0.5 + 0.25 * (texture2D(uScene, uv + dir * -0.5).rgb + texture2D(uScene, uv + dir * 0.5).rgb);
+  float lB = dot(rgbB, LUMA);
+  return (lB < lMin || lB > lMax) ? rgbA : rgbB;
+}
+
+void main(){
+  vec2 uv = vUV;
+  if (uE.x > 0.001) {   // heat haze: distorsion suave cerca del horizonte
+    float band = smoothstep(0.15, 0.55, uv.y) * smoothstep(0.95, 0.60, uv.y);
+    vec2 n = vec2(sin(uv.y * 70.0 + uB.x * 2.3), cos(uv.x * 55.0 + uB.x * 1.9));
+    uv += n * 0.0020 * uE.x * band;
+  }
+  vec3 scene = (uE.z > 0.5) ? fxaa(uv) : texture2D(uScene, uv).rgb;
+  if (uD.z > 0.00001) {   // aberracion cromatica
+    vec2 cd = (uv - 0.5) * uD.z;
+    scene.r = texture2D(uScene, uv + cd).r;
+    scene.b = texture2D(uScene, uv - cd).b;
+  }
+  if (uD.w > 0.001) {     // sharpen
+    vec3 nb = (texture2D(uScene, uv + vec2(uF.x, 0.0)).rgb + texture2D(uScene, uv - vec2(uF.x, 0.0)).rgb
+             + texture2D(uScene, uv + vec2(0.0, uF.y)).rgb + texture2D(uScene, uv - vec2(0.0, uF.y)).rgb) * 0.25;
+    scene = clamp(scene + (scene - nb) * uD.w, 0.0, 1.0);
+  }
+
+  vec2 asp = vec2(uB.y, 1.0);
+  vec2 pc = (vUV - 0.5) * asp;
+  vec2 sc = (uSun - 0.5) * asp;
+  float dsun = length(pc - sc);
+  vec3 rays = texture2D(uRays, vUV).rgb;
+  rays = pow(rays, vec3(1.4)) * exp(-dsun * 2.0) * uA.x * uTint;
+  rays *= mix(0.45, 1.0, smoothstep(0.0, 0.35, length(sc)));
+  vec3 bloom = texture2D(uBloom, vUV).rgb * uA.y;
+
+  float fl = exp(-dsun * 7.0) * 0.50;
+  fl += smoothstep(0.075, 0.020, length(pc + sc * 0.45)) * 0.16;
+  fl += smoothstep(0.110, 0.040, length(pc + sc * 0.85)) * 0.10;
+  fl += smoothstep(0.050, 0.015, length(pc + sc * 1.45)) * 0.14;
+  fl *= smoothstep(0.0, 0.25, length(sc)) * 0.6 + 0.4;
+  vec3 flare = fl * uA.z * vec3(1.0, 0.86, 0.66);
+
+  vec3 glow = min(rays + bloom + flare, vec3(0.70));
+  vec3 col = scene + (1.0 - scene) * glow;
+
+  if (uA.w > 0.002) {     // lluvia
+    float lum = dot(col, LUMA);
+    col = mix(col, vec3(lum) * vec3(0.93, 0.97, 1.04), 0.20 * uA.w);
+    col *= 1.0 - 0.10 * uA.w;
+    float r = rainLayer(vUV, 60.0, 5.0, 0.18) * 0.55 + rainLayer(vUV, 110.0, 7.5, 0.20) * 0.40 + rainLayer(vUV, 190.0, 10.0, 0.22) * 0.30;
+    col += r * uA.w * vec3(0.72, 0.80, 0.90) * 0.55;
+  }
+  if (uE.y > 0.002) {     // brillo de suelo mojado (aproximado)
+    float ground = smoothstep(0.50, 0.08, vUV.y);
+    float nz = vnoise(vUV * vec2(7.0 * uB.y, 11.0) + vec2(0.0, uB.x * 0.03));
+    float m = ground * smoothstep(0.52, 0.78, nz) * uE.y;
+    vec3 skyc = texture2D(uScene, vec2(0.5, 0.90)).rgb;
+    col = mix(col, col * 0.75 + skyc * 0.30, m);
+  }
+
+  col *= uC.x;                                   // exposicion
+  col = mix(col, aces(col), uC.y);               // tonemapping
+  col *= vec3(1.0 + uC.w, 1.0, 1.0 - uC.w);      // balance de blancos
+  float lm = dot(col, LUMA);
+  col += uG * (1.0 - smoothstep(0.0, 0.55, lm)) + uH * smoothstep(0.45, 1.0, lm);   // color grading
+  col = pow(max(col, vec3(0.0)), vec3(1.0 / uC.z));                                  // gamma
+  float l2 = dot(col, LUMA);
+  col = mix(vec3(l2), col, uB.z);                // saturacion
+  col = (col - 0.5) * uB.w + 0.5;                // contraste
+  float vd = length((vUV - 0.5) * vec2(uB.y * 0.8, 1.0));
+  col *= 1.0 - uD.x * smoothstep(0.35, 1.0, vd); // vineta
+  col += (hash(vUV * 1000.0 + fract(uB.x) * 91.7) - 0.5) * uD.y;                     // grano
+  gl_FragColor = vec4(col, 1.0);
+}
+)GLSL";
+
+struct FinalLocs { GLint scene, rays, bloom, sun, A, B, tint, C, D, E, F, G, H; };
+static Prog pFinal2; static FinalLocs fl;
+
 static void RunFX() {
     int w, h; ScreenSize(w, h);
     if (w < 64 || h < 64) return;
@@ -430,8 +606,8 @@ static void RunFX() {
     if (!(fabsf(u) < 4.f && fabsf(v) < 4.f)) vis = 0.f;
 
     if ((frame % 300) == 1)
-        LOG("camOK=%d front=%d sunUV=(%.2f,%.2f) gameUV=(%.2f,%.2f) sunUp=%.2f rain=%.2f wind=%.2f progs=%d agua=%d viento=%d fallos=%d",
-            camOK, front, u, v, gu, gv, F.sunUp, pRain ? *pRain : -1.f, pWind ? *pWind : -1.f, gNProgs, g_nWater, g_nWind, g_nPatchFail);
+        LOG("camOK=%d front=%d sunUV=(%.2f,%.2f) sunUp=%.2f rain=%.2f wind=%.2f progs=%d agua=%d viento=%d fallos=%d",
+            camOK, front, u, v, F.sunUp, pRain ? *pRain : -1.f, pWind ? *pWind : -1.f, gNProgs, g_nWater, g_nWind, g_nPatchFail);
 
     float ex = fmaxf(fmaxf(-u, u - 1.f), 0.f), ey = fmaxf(fmaxf(-v, v - 1.f), 0.f);
     float edge = 1.f - smooth(0.f, 0.45f, fmaxf(ex, ey));
@@ -439,20 +615,35 @@ static void RunFX() {
     float rayK   = C.godRays > 0.5f ? C.rayInt * F.sunUp * vis * edge * (1.f - 0.65f * blockedK) : 0.f;
     float flareK = C.flare   > 0.5f ? C.flareInt * F.sunUp * vis * edge * (1.f - 0.80f * blockedK) : 0.f;
     float bloomK = C.bloom   > 0.5f ? C.bloomInt : 0.f;
-    float rainK  = 0.f;
-    if (C.rain > 0.5f && pRain) {
-        rainK = clamp01(*pRain) * C.rainInt;
-        if (pTunnel) rainK *= 1.f - clamp01(*pTunnel);
-        if (pUnder)  rainK *= 1.f - clamp01(*pUnder);
-    }
-    bool needGrade = fabsf(C.sat - 1.f) > 0.01f || fabsf(C.contrast - 1.f) > 0.01f;
-    bool anyFX = rayK > 0.005f || flareK > 0.005f || bloomK > 0.005f || rainK > 0.005f || needGrade;
+
+    float envK = 1.f;
+    if (pTunnel) envK *= 1.f - clamp01(*pTunnel);
+    if (pUnder)  envK *= 1.f - clamp01(*pUnder);
+    float rainRaw = pRain ? clamp01(*pRain) : 0.f;
+    float rainK = C.rain > 0.5f ? rainRaw * C.rainInt * envK : 0.f;
+    float wetRoads = pWetRoads ? clamp01(*pWetRoads) : 0.f;
+    float wetK = D.wet * clamp01(fmaxf(rainRaw, wetRoads)) * envK;
+    float heatK = (pHeat ? clamp01(*pHeat) : 0.f) * D.heat * envK;
+
+    bool anyFX = rayK > 0.005f || flareK > 0.005f || bloomK > 0.005f || rainK > 0.005f || wetK > 0.005f || heatK > 0.005f
+        || D.fxaa > 0.5f || D.vignette > 0.001f || D.grain > 0.001f || D.chroma > 0.00001f || D.sharpen > 0.001f
+        || D.tonemap > 0.001f || fabsf(D.exposure - 1.f) > 0.01f || fabsf(D.gamma - 1.f) > 0.01f || fabsf(D.wb) > 0.001f
+        || fabsf(C.sat - 1.f) > 0.01f || fabsf(C.contrast - 1.f) > 0.01f;
 
     if (!gReady || w != gW || h != gH) {
         GLState s0; Save(s0);
         gReady = InitGL(w, h);
         Restore(s0);
         if (!gReady) { gFailed = true; return; }
+    }
+    if (!pFinal2.id) {
+        pFinal2.id = Link(kVS, kFSFinal2);
+        if (!pFinal2.id) { LOG("shader final v0.3 no compila, plugin de pantalla desactivado"); gFailed = true; return; }
+        GLuint p = pFinal2.id;
+        fl.scene = glGetUniformLocation(p, "uScene"); fl.rays = glGetUniformLocation(p, "uRays"); fl.bloom = glGetUniformLocation(p, "uBloom");
+        fl.sun = glGetUniformLocation(p, "uSun"); fl.A = glGetUniformLocation(p, "uA"); fl.B = glGetUniformLocation(p, "uB");
+        fl.tint = glGetUniformLocation(p, "uTint"); fl.C = glGetUniformLocation(p, "uC"); fl.D = glGetUniformLocation(p, "uD");
+        fl.E = glGetUniformLocation(p, "uE"); fl.F = glGetUniformLocation(p, "uF"); fl.G = glGetUniformLocation(p, "uG"); fl.H = glGetUniformLocation(p, "uH");
     }
     if (frame < 600 ? (frame % 30) == 0 : (frame % 300) == 0) {
         GLState sr; Save(sr); RescanPrograms(); Restore(sr);
@@ -466,26 +657,22 @@ static void RunFX() {
         glDisable(GL_STENCIL_TEST); glDisable(GL_BLEND);
         glDepthMask(GL_FALSE); glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
-        // 1) copiar escena
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tScene);
         glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, w, h);
 
-        // 2) zonas brillantes (mitad de resolucion)
         if (rayK > 0.005f || bloomK > 0.005f) {
             Target(tBright, hW, hH);
             glUseProgram(pBright.id); glUniform1i(pBright.a, 0);
             glUniform1f(pBright.b, fminf(C.rayThr, C.bloomThr));
             glBindTexture(GL_TEXTURE_2D, tScene); DrawTri();
         }
-        // 3) barrido radial hacia el sol
         if (rayK > 0.005f) {
             Target(tRays, hW, hH);
             glUseProgram(pRays.id); glUniform1i(pRays.a, 0);
             glUniform2f(pRays.b, u, v); glUniform1f(pRays.c, C.rayDens);
             glBindTexture(GL_TEXTURE_2D, tBright); DrawTri();
         }
-        // 4) bloom: desenfoque horizontal y vertical (cuarto de resolucion)
         if (bloomK > 0.005f) {
             glUseProgram(pBlur.id); glUniform1i(pBlur.a, 0);
             Target(tBlurA, qW, qH); glUniform2f(pBlur.b, 1.f / hW, 0.f);
@@ -493,17 +680,22 @@ static void RunFX() {
             Target(tBlurB, qW, qH); glUniform2f(pBlur.b, 0.f, 1.f / qH);
             glBindTexture(GL_TEXTURE_2D, tBlurA); DrawTri();
         }
-        // 5) composicion final a pantalla
         glBindFramebuffer(GL_FRAMEBUFFER, 0); glViewport(0, 0, w, h);
-        glUseProgram(pFinal.id);
+        glUseProgram(pFinal2.id);
         glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tScene);
         glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, tRays);
         glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, tBlurB);
-        glUniform1i(pFinal.a, 0); glUniform1i(pFinal.b, 1); glUniform1i(pFinal.c, 2);
-        glUniform2f(pFinal.d, u, v);
-        glUniform4f(pFinal.e, rayK, bloomK, flareK, rainK);
-        glUniform4f(pFinal.f, F.t, (float)w / (float)h, C.sat, C.contrast);
-        glUniform3f(pFinal.g, C.tintR, C.tintG, C.tintB);
+        glUniform1i(fl.scene, 0); glUniform1i(fl.rays, 1); glUniform1i(fl.bloom, 2);
+        glUniform2f(fl.sun, u, v);
+        glUniform4f(fl.A, rayK, bloomK, flareK, rainK);
+        glUniform4f(fl.B, F.t, (float)w / (float)h, C.sat, C.contrast);
+        glUniform3f(fl.tint, C.tintR, C.tintG, C.tintB);
+        glUniform4f(fl.C, D.exposure, D.tonemap, fmaxf(D.gamma, 0.2f), D.wb);
+        glUniform4f(fl.D, D.vignette, D.grain, D.chroma, D.sharpen);
+        glUniform4f(fl.E, heatK, wetK, D.fxaa > 0.5f ? 1.f : 0.f, 0.f);
+        glUniform4f(fl.F, 1.f / (float)w, 1.f / (float)h, 0.f, 0.f);
+        glUniform3f(fl.G, D.stR, D.stG, D.stB);
+        glUniform3f(fl.H, D.htR, D.htG, D.htB);
         DrawTri();
     }
     Restore(st);
@@ -602,10 +794,11 @@ static void Wind_hook(float v) {
 }
 
 // =============================== CARGA DEL MOD ===============================
-ON_MOD_PRELOAD() { LOG("SAFX 0.2 preload"); }
+ON_MOD_PRELOAD() { LOG("SAFX 0.3 preload"); }
 
 ON_MOD_LOAD() {
     LoadConfig();
+    LoadConfig2();
     void* h = (void*)aml->GetLibHandle("libGTASA.so");
     if (!h) { LOG("no se encontro libGTASA.so"); return; }
     auto sym = [&](const char* n) { return (void*)aml->GetSym(h, n); };
@@ -620,6 +813,8 @@ ON_MOD_LOAD() {
     pWindDir    = (float*)sym("_ZN8CWeather7WindDirE");
     pTunnel     = (float*)sym("_ZN8CWeather12InTunnelnessE");
     pUnder      = (float*)sym("_ZN8CWeather14UnderWaternessE");
+    pHeat       = (float*)sym("_ZN8CWeather8HeatHazeE");
+    pWetRoads   = (float*)sym("_ZN8CWeather8WetRoadsE");
     pTheCamera  =         sym("TheCamera");
     CalcScreen  = (CalcScreenFn)sym("_ZN7CSprite15CalcScreenCoorsERK5RwV3dPS0_PfS4_bb");
 
