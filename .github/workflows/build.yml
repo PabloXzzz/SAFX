@@ -1,0 +1,19 @@
+name: Build SAFX64
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Descargar headers de AML
+        run: |
+          git clone --depth 1 https://github.com/RusJJ/AndroidModLoader aml
+          cp -r aml/mod jni/mod
+      - name: Compilar con NDK
+        run: $ANDROID_NDK_LATEST_HOME/ndk-build -j4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libSAFX64
+          path: libs/arm64-v8a/libSAFX64.so
