@@ -407,7 +407,6 @@ static void UploadGameUniforms() {
 }
 
 // =============================== EFECTOS EN PANTALLA ===============================
-// =============================== EFECTOS EN PANTALLA ===============================
 #include <sys/stat.h>
 static float* pHeat = nullptr; static float* pWetRoads = nullptr; static int* pArea = nullptr;
 
