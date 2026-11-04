@@ -799,6 +799,113 @@ static void SunColor(float z, float* c) {   // naranja con el sol bajo, amarillo
     c[0] = 1.0f; c[1] = 0.45f + 0.43f * t; c[2] = 0.18f + 0.42f * t;
 }
 
+// =============================== CONFIG AMPLIADA (v0.5) ===============================
+#include <stdarg.h>
+struct Cfg4 {
+    float giOn = 1, giStrength = 0.7f, hazeOn = 1, hazeDensity = 0.0009f, hazeFalloff = 0.03f;
+    float puddles = 1, puddleRefl = 0.85f, ripples = 1, dryGround = 240.f;
+    float carRain = 1, carStrength = 1.f, carStreaks = 1, dryCar = 120.f;
+} L4;
+static int g_nWorld = 0, g_nVeh = 0;
+static char g_logPath[340] = ""; static int g_logLines = 0;
+static void FLog(const char* fmt, ...) {      // registro en <configs>/SAFX64.log (para diagnosticar sin logcat)
+    if (!g_logPath[0] || g_logLines > 400) return;
+    FILE* lf = fopen(g_logPath, "a"); if (!lf) return;
+    va_list ap; va_start(ap, fmt); vfprintf(lf, fmt, ap); va_end(ap);
+    fputc('\n', lf); fclose(lf); g_logLines++;
+}
+static Ent kEnt2[] = {
+    {"Lighting","Enable",&L4.giOn},{"Lighting","Strength",&L4.giStrength},
+    {"Haze","Enable",&L4.hazeOn},{"Haze","Density",&L4.hazeDensity},{"Haze","HeightFalloff",&L4.hazeFalloff},
+    {"Puddles","Enable",&L4.puddles},{"Puddles","Reflection",&L4.puddleRefl},{"Puddles","Ripples",&L4.ripples},{"Puddles","DryTime",&L4.dryGround},
+    {"VehicleRain","Enable",&L4.carRain},{"VehicleRain","Strength",&L4.carStrength},{"VehicleRain","Streaks",&L4.carStreaks},{"VehicleRain","DryTime",&L4.dryCar},
+};
+static void LoadConfig4() {
+    const int NE = (int)(sizeof(kEnt) / sizeof(kEnt[0]));
+    const int NE2 = (int)(sizeof(kEnt2) / sizeof(kEnt2[0]));
+    char dir[300];
+    const char* cp = ToCStr(aml->GetConfigPath());
+    snprintf(dir, sizeof dir, "%s", (cp && cp[0]) ? cp : "/storage/emulated/0/Android/data/com.rockstargames.gtasa/configs");
+    size_t n = strlen(dir); while (n > 1 && dir[n - 1] == '/') dir[--n] = 0;
+    mkdir(dir, 0777);
+    char path[340]; snprintf(path, sizeof path, "%s/SAFX64.ini", dir);
+    snprintf(g_logPath, sizeof g_logPath, "%s/SAFX64.log", dir);
+    { FILE* lf = fopen(g_logPath, "w"); if (lf) fclose(lf); }
+
+    bool found2[64] = {false};
+    FILE* f = fopen(path, "r");
+    if (f) {
+        char sec[48] = "", line[200];
+        while (fgets(line, sizeof line, f)) {
+            char* s = line; while (*s == ' ' || *s == '\t') s++;
+            if (!*s || *s == '#' || *s == ';' || *s == '\n' || *s == '\r') continue;
+            if (*s == '[') { char* e = strchr(s, ']'); if (e) { *e = 0; snprintf(sec, sizeof sec, "%s", s + 1); } continue; }
+            char* eq = strchr(s, '='); if (!eq) continue;
+            *eq = 0; char* key = s; char* val = eq + 1;
+            for (char* e = key + strlen(key); e > key && (e[-1] == ' ' || e[-1] == '\t'); ) *--e = 0;
+            for (int i = 0; i < NE2; i++)
+                if (!strcmp(kEnt2[i].sec, sec) && !strcmp(kEnt2[i].key, key)) { *kEnt2[i].v = (float)atof(val); found2[i] = true; }
+        }
+        fclose(f);
+    }
+    bool missing = false;
+    for (int i = 0; i < NE2; i++) if (!found2[i]) missing = true;
+    if (R.cfgVer < 3.f) { D.wet = 0.f; R.cfgVer = 3.f; missing = true; }   // el brillo falso del suelo se reemplaza por charcos reales
+    if (missing) {
+        FILE* o = fopen(path, "w");
+        if (o) {
+            fprintf(o, "; SAFX64 - configuracion de graficos. 1 = activado, 0 = desactivado.\n; Se lee al abrir el juego.\n");
+            const char* last = "";
+            for (int i = 0; i < NE; i++) {
+                if (strcmp(last, kEnt[i].sec)) { fprintf(o, "\n[%s]\n", kEnt[i].sec); last = kEnt[i].sec; }
+                fprintf(o, "%s = %g\n", kEnt[i].key, *kEnt[i].v);
+            }
+            for (int i = 0; i < NE2; i++) {
+                if (strcmp(last, kEnt2[i].sec)) { fprintf(o, "\n[%s]\n", kEnt2[i].sec); last = kEnt2[i].sec; }
+                fprintf(o, "%s = %g\n", kEnt2[i].key, *kEnt2[i].v);
+            }
+            fclose(o); LOG("SAFX64.ini actualizado en %s", path);
+        }
+    }
+    FLog("SAFX 0.5 cargado. config: %s", path);
+}
+
+// ---- uniformes SAFX_* que los shaders parcheados del juego necesitan cada frame ----
+struct GP2 { GLuint id; GLint u[9]; };   // 0..5 = P0..P5, 6 = Cam, 7 = VP, 8 = Refl
+static const char* kUN[9] = { "SAFX_P0", "SAFX_P1", "SAFX_P2", "SAFX_P3", "SAFX_P4", "SAFX_P5", "SAFX_Cam", "SAFX_VP", "SAFX_Refl" };
+static GP2 gP2[200]; static int gNP2 = 0;
+static void RescanPrograms2() {
+    for (GLuint p = 1; p <= 3000 && gNP2 < 200; p++) {
+        if (!glIsProgram(p)) continue;
+        bool known = false;
+        for (int i = 0; i < gNP2; i++) if (gP2[i].id == p) { known = true; break; }
+        if (known) continue;
+        GP2 g; g.id = p; bool any = false;
+        for (int k = 0; k < 9; k++) { g.u[k] = glGetUniformLocation(p, kUN[k]); if (g.u[k] >= 0) any = true; }
+        if (any) gP2[gNP2++] = g;
+    }
+    while (glGetError() != GL_NO_ERROR) {}
+}
+static void UploadGameUniforms2(const float* VP, const float* camPos, float wetGround, float wetCarV, float rainNow) {
+    float sc[3]; SunColor(F.sunZ, sc);
+    float giK = L4.giOn > 0.5f ? L4.giStrength : 0.f;
+    float hz = L4.hazeOn > 0.5f ? L4.hazeDensity : 0.f;
+    for (int i = 0; i < gNP2; i++) {
+        GP2& g = gP2[i];
+        if (!glIsProgram(g.id)) continue;
+        glUseProgram(g.id);
+        if (g.u[0] >= 0) glUniform4f(g.u[0], F.t, F.windX, F.windY, F.windAmp);
+        if (g.u[1] >= 0) glUniform4f(g.u[1], F.sunX, F.sunY, F.sunZ, C.waterSpec * F.sunUp);
+        if (g.u[2] >= 0) glUniform4f(g.u[2], sc[0], sc[1], sc[2], C.waterFres);
+        if (g.u[3] >= 0) glUniform4f(g.u[3], wetGround, wetCarV, rainNow, F.t);
+        if (g.u[4] >= 0) glUniform4f(g.u[4], giK, hz, L4.hazeFalloff, F.sunUp);
+        if (g.u[5] >= 0) glUniform4f(g.u[5], L4.puddleRefl, L4.ripples > 0.5f ? 1.f : 0.f, L4.carRain > 0.5f ? L4.carStrength : 0.f, L4.carStreaks > 0.5f ? 1.f : 0.f);
+        if (g.u[6] >= 0 && camPos) glUniform3f(g.u[6], camPos[0], camPos[1], camPos[2]);
+        if (g.u[7] >= 0 && VP) glUniformMatrix4fv(g.u[7], 1, GL_FALSE, VP);
+        if (g.u[8] >= 0) glUniform1i(g.u[8], 6);
+    }
+}
+
 static void RunFX() {
     static int frame = 0; frame++;
     static int lastMenu = 0, lastScene = 0; static bool sceneSeen = false;
@@ -855,6 +962,18 @@ static void RunFX() {
     float wetK = D.wet * clamp01(fmaxf(rainRaw, wetRoads)) * envK;
     float heatK = (pHeat ? clamp01(*pHeat) : 0.f) * D.heat * envK;
 
+    // humedad acumulada: sube mientras llueve y se seca con el tiempo
+    static float wetG = 0.f, wetCar = 0.f; static double lastT = 0.0;
+    double nowT = NowSec(); float dt = lastT > 0.0 ? fminf((float)(nowT - lastT), 0.25f) : 0.f; lastT = nowT;
+    float rainNow = rainRaw * envK;
+    if (rainNow > 0.05f) { wetG += rainNow * dt / 20.f; wetCar += rainNow * dt / 6.f; }
+    else { wetG -= dt / fmaxf(L4.dryGround, 5.f); wetCar -= dt / fmaxf(L4.dryCar, 5.f); }
+    wetG = clamp01(wetG); wetCar = clamp01(wetCar);
+    float wetGroundUse = fmaxf(wetG, wetRoads * 0.85f * envK);
+
+    if ((frame % 900) == 1)
+        FLog("frame=%d camOK=%d sunUp=%.2f rain=%.2f wetG=%.2f wetCar=%.2f progs=%d mats=%d agua=%d viento=%d mundo=%d vehiculo=%d fallos=%d",
+             frame, camOK, F.sunUp, rainRaw, wetG, wetCar, gNP2, gNMats, g_nWater, g_nWind, g_nWorld, g_nVeh, g_nPatchFail);
     if ((frame % 300) == 1)
         LOG("camOK=%d front=%d sunUV=(%.2f,%.2f) sunUp=%.2f rain=%.2f wind=%.2f progs=%d mats=%d agua=%d viento=%d fallos=%d",
             camOK, front, u, v, F.sunUp, rainRaw, pWind ? *pWind : -1.f, gNProgs, gNMats, g_nWater, g_nWind, g_nPatchFail);
@@ -887,11 +1006,12 @@ static void RunFX() {
         fl.E = glGetUniformLocation(p, "uE"); fl.F = glGetUniformLocation(p, "uF"); fl.G = glGetUniformLocation(p, "uG"); fl.H = glGetUniformLocation(p, "uH");
     }
     if (frame < 600 ? (frame % 30) == 0 : (frame % 300) == 0) {
-        GLState sr; Save(sr); RescanPrograms(); RescanMats(); Restore(sr);
+        GLState sr; Save(sr); RescanPrograms2(); RescanMats(); Restore(sr);
     }
 
     GLState st; Save(st);
-    UploadGameUniforms();
+    float VPm[16]; bool vpOK = camOK && GetViewProj(VPm, cam + 12);
+    UploadGameUniforms2(vpOK ? VPm : nullptr, camOK ? cam + 12 : nullptr, wetGroundUse, wetCar, rainNow);
 
     // lluvia 3D (se dibuja antes del post-proceso para que reciba bloom y color)
     bool rain3dDone = false;
@@ -950,13 +1070,16 @@ static void RunFX() {
         DrawTri();
     }
     Restore(st);
+    // la escena de este frame queda en la unidad 6 para que los charcos la reflejen en el siguiente
+    glActiveTexture(GL_TEXTURE0 + 6); glBindTexture(GL_TEXTURE_2D, tScene); glActiveTexture(st.activeTex);
     while (glGetError() != GL_NO_ERROR) {}
 }
 
 static void Swap_hook(char*& cmd) {
     if (!gFailed) RunFX();
     Swap_orig(cmd);
-}
+} 
+
 // =============================== PARCHES DE SHADERS DEL JUEGO ===============================
 static bool TestCompile(const char* vs, const char* fs) {
     GLuint v = glCreateShader(GL_VERTEX_SHADER); if (!v) return false;
@@ -966,6 +1089,13 @@ static bool TestCompile(const char* vs, const char* fs) {
     glShaderSource(v, 1, &vs, nullptr); glCompileShader(v); glGetShaderiv(v, GL_COMPILE_STATUS, &ok);
     glShaderSource(f, 1, &fs, nullptr); glCompileShader(f); glGetShaderiv(f, GL_COMPILE_STATUS, &ok2);
     if (ok && ok2) { glAttachShader(p, v); glAttachShader(p, f); glLinkProgram(p); glGetProgramiv(p, GL_LINK_STATUS, &ok3); }
+    if (!(ok && ok2 && ok3) && g_nPatchFail < 6) {   // guardar el motivo en SAFX64.log
+        char b[700]; b[0] = 0;
+        if (!ok) glGetShaderInfoLog(v, sizeof b, nullptr, b);
+        else if (!ok2) glGetShaderInfoLog(f, sizeof b, nullptr, b);
+        else glGetProgramInfoLog(p, sizeof b, nullptr, b);
+        FLog("parche rechazado (%s): %s", !ok ? "vertex" : (!ok2 ? "fragment" : "link"), b);
+    }
     glDeleteProgram(p); glDeleteShader(v); glDeleteShader(f);
     while (glGetError() != GL_NO_ERROR) {}
     return ok && ok2 && ok3;
@@ -1017,21 +1147,193 @@ static bool PatchWind(std::string& vs) {
     return InsertAfter(vs, kWorldPosAnchor, code);
 }
 
+// ---- parche del mundo: iluminacion por pixel, bruma con dispersion solar, charcos con reflejo y gotas en carros ----
+static const char* kWHeader = R"GLSL(
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+#define SAFX_HP highp
+#else
+#define SAFX_HP mediump
+#endif
+varying SAFX_HP vec3 SAFX_Wp; varying mediump vec3 SAFX_Wn; varying mediump vec3 SAFX_Lp;
+uniform SAFX_HP vec3 SAFX_Cam; uniform SAFX_HP mat4 SAFX_VP; uniform sampler2D SAFX_Refl;
+uniform mediump vec4 SAFX_P1; uniform mediump vec4 SAFX_P2; uniform mediump vec4 SAFX_P3; uniform mediump vec4 SAFX_P4; uniform mediump vec4 SAFX_P5;
+float SAFX_h(SAFX_HP vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+float SAFX_n(SAFX_HP vec2 p){
+  SAFX_HP vec2 i = floor(p); SAFX_HP vec2 f = fract(p); f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(SAFX_h(i), SAFX_h(i + vec2(1.0, 0.0)), f.x), mix(SAFX_h(i + vec2(0.0, 1.0)), SAFX_h(i + vec2(1.0, 1.0)), f.x), f.y);
+}
+)GLSL";
+
+static const char* kWCommon = R"GLSL(
+{
+  vec3 SAFX_N = SAFX_Wn;
+  float SAFX_nn = dot(SAFX_N, SAFX_N);
+  SAFX_N = (SAFX_nn > 0.01) ? SAFX_N * inversesqrt(SAFX_nn) : vec3(0.0, 0.0, 1.0);
+  vec3 SAFX_Vw = SAFX_Wp - SAFX_Cam;
+  float SAFX_D = max(length(SAFX_Vw), 0.01);
+  vec3 SAFX_V = SAFX_Vw / SAFX_D;
+  float SAFX_sunUp = SAFX_P4.w;
+)GLSL";
+
+static const char* kWGI = R"GLSL(
+  {
+    float SAFX_gk = SAFX_P4.x * smoothstep(0.0, 0.35, SAFX_sunUp);
+    float SAFX_lit = smoothstep(-0.15, 0.55, dot(SAFX_N, SAFX_P1.xyz));
+    vec3 SAFX_hs = FogColor * 1.1 + vec3(0.02, 0.04, 0.08);
+    vec3 SAFX_hg = vec3(0.30, 0.26, 0.22) * (0.4 + 0.6 * SAFX_sunUp);
+    vec3 SAFX_am = mix(SAFX_hg, SAFX_hs, SAFX_N.z * 0.5 + 0.5);
+    vec3 SAFX_gi = SAFX_am * 0.55 + SAFX_P2.xyz * (SAFX_sunUp * SAFX_lit * 0.75);
+    fcolor.xyz *= mix(vec3(1.0), SAFX_gi, SAFX_gk);
+  }
+)GLSL";
+
+static const char* kWHaze = R"GLSL(
+  {
+    float SAFX_hh = exp(-max(0.5 * (SAFX_Wp.z + SAFX_Cam.z), 0.0) * SAFX_P4.z);
+    float SAFX_fa = clamp((1.0 - exp(-SAFX_D * SAFX_P4.y)) * SAFX_hh, 0.0, 0.8);
+    float SAFX_sd = pow(max(dot(SAFX_V, SAFX_P1.xyz), 0.0), 5.0);
+    vec3 SAFX_hc = mix(FogColor, SAFX_P2.xyz, SAFX_sd * SAFX_sunUp * 0.85) * 1.4;
+    fcolor.xyz = mix(fcolor.xyz, SAFX_hc, SAFX_fa);
+  }
+)GLSL";
+
+static const char* kWGround = R"GLSL(
+  if (SAFX_P3.x > 0.01 && SAFX_N.z > 0.75) {
+    float SAFX_W = SAFX_P3.x;
+    float SAFX_up = smoothstep(0.75, 0.95, SAFX_N.z);
+    float SAFX_pn = SAFX_n(SAFX_Wp.xy * 0.22) * 0.65 + SAFX_n(SAFX_Wp.xy * 0.9) * 0.35;
+    float SAFX_pd = smoothstep(0.70 - 0.40 * SAFX_W, 0.80 - 0.40 * SAFX_W, SAFX_pn) * SAFX_up;
+    fcolor.xyz *= 1.0 - (0.28 * SAFX_W * SAFX_up + 0.30 * SAFX_pd);
+    vec2 SAFX_rp = vec2(0.0);
+    float SAFX_rg = 0.0;
+    if (SAFX_P5.y > 0.5 && SAFX_P3.z > 0.02 && SAFX_pd > 0.01) {
+      SAFX_HP vec2 SAFX_q = SAFX_Wp.xy * 3.0;
+      SAFX_HP vec2 SAFX_id = floor(SAFX_q);
+      vec2 SAFX_f = fract(SAFX_q) - 0.5;
+      float SAFX_ph = fract(SAFX_P3.w * 0.9 + SAFX_h(SAFX_id));
+      float SAFX_ring = smoothstep(0.07, 0.0, abs(length(SAFX_f) - SAFX_ph * 0.45)) * (1.0 - SAFX_ph);
+      SAFX_rg = SAFX_ring * step(0.45, SAFX_h(SAFX_id + 7.0)) * SAFX_P3.z;
+      SAFX_rp = SAFX_f * SAFX_rg * 0.04;
+    }
+    vec3 SAFX_R = reflect(SAFX_V, vec3(0.0, 0.0, 1.0));
+    SAFX_HP vec4 SAFX_c = SAFX_VP * vec4(SAFX_Wp + SAFX_R * 28.0, 1.0);
+    vec2 SAFX_uv = SAFX_c.xy / SAFX_c.w * 0.5 + 0.5 + SAFX_rp;
+    vec2 SAFX_e = min(SAFX_uv, 1.0 - SAFX_uv);
+    float SAFX_vis = (SAFX_c.w > 0.1) ? smoothstep(0.0, 0.16, min(SAFX_e.x, SAFX_e.y)) : 0.0;
+    vec3 SAFX_rc = texture2D(SAFX_Refl, clamp(SAFX_uv, 0.003, 0.997)).rgb;
+    vec3 SAFX_sk = mix(FogColor, FogColor * 1.25 + vec3(0.04, 0.07, 0.12), clamp(SAFX_R.z * 1.5, 0.0, 1.0)) * 1.4;
+    SAFX_rc = mix(SAFX_sk, SAFX_rc, SAFX_vis);
+    float SAFX_F = 0.04 + 0.96 * pow(1.0 - clamp(-SAFX_V.z, 0.0, 1.0), 5.0);
+    fcolor.xyz = mix(fcolor.xyz, SAFX_rc, clamp(SAFX_pd * (0.30 + 0.70 * SAFX_F) * SAFX_P5.x, 0.0, 0.92));
+    fcolor.xyz += SAFX_P2.xyz * (pow(max(dot(SAFX_R, SAFX_P1.xyz), 0.0), 90.0) * SAFX_pd * SAFX_sunUp * 1.5 + SAFX_rg * 0.12);
+  }
+)GLSL";
+
+static const char* kWCar = R"GLSL(
+  if (SAFX_P3.y > 0.01 && SAFX_P5.z > 0.01) {
+    float SAFX_cv = SAFX_P3.y * SAFX_P5.z;
+    SAFX_HP vec2 SAFX_bu = Out_Tex0 * 26.0;
+    SAFX_HP vec2 SAFX_bi = floor(SAFX_bu);
+    vec2 SAFX_bf = fract(SAFX_bu) - 0.5;
+    float SAFX_h1 = SAFX_h(SAFX_bi);
+    float SAFX_h2 = SAFX_h(SAFX_bi + 17.3);
+    float SAFX_h3 = SAFX_h(SAFX_bi + 41.7);
+    float SAFX_on = step(SAFX_h1, SAFX_cv * 0.75);
+    vec2 SAFX_of = (vec2(SAFX_h2, SAFX_h3) - 0.5) * 0.45;
+    float SAFX_r = 0.10 + 0.16 * SAFX_h2;
+    float SAFX_d = length(SAFX_bf - SAFX_of);
+    float SAFX_body = smoothstep(SAFX_r, SAFX_r * 0.72, SAFX_d) * SAFX_on;
+    float SAFX_rim = (smoothstep(SAFX_r, SAFX_r * 0.78, SAFX_d) - smoothstep(SAFX_r * 0.78, SAFX_r * 0.50, SAFX_d)) * SAFX_on;
+    vec2 SAFX_hl = (SAFX_bf - SAFX_of) / SAFX_r;
+    float SAFX_sp = smoothstep(0.55, 0.0, length(SAFX_hl - vec2(-0.35, 0.40))) * SAFX_body;
+    vec3 SAFX_skyc = FogColor * 1.4;
+    fcolor.xyz = mix(fcolor.xyz, fcolor.xyz * 0.80 + SAFX_skyc * 0.20, SAFX_body * 0.45);
+    fcolor.xyz *= 1.0 - 0.30 * SAFX_rim;
+    fcolor.xyz += (SAFX_P2.xyz * 0.6 + 0.2) * SAFX_sp * (0.25 + 0.75 * SAFX_sunUp);
+    if (SAFX_P5.w > 0.5) {
+      SAFX_HP vec2 SAFX_su = vec2(SAFX_Lp.x * 6.0 + SAFX_Lp.y * 4.1, SAFX_Lp.z * 2.2);
+      SAFX_HP float SAFX_col = floor(SAFX_su.x);
+      float SAFX_sh = SAFX_h(vec2(SAFX_col, 3.0));
+      float SAFX_cz = floor(SAFX_su.y);
+      float SAFX_fz = fract(SAFX_su.y);
+      float SAFX_hp = 1.0 - fract(SAFX_sh * 7.0 + SAFX_P3.w * (0.05 + 0.09 * SAFX_sh));
+      float SAFX_xx = abs(fract(SAFX_su.x) - 0.5 - (SAFX_sh - 0.5) * 0.4);
+      float SAFX_ln = smoothstep(0.07, 0.0, SAFX_xx);
+      float SAFX_bulb = smoothstep(0.07, 0.0, abs(SAFX_fz - SAFX_hp)) * SAFX_ln;
+      float SAFX_tr = step(SAFX_hp, SAFX_fz) * clamp(1.0 - (SAFX_fz - SAFX_hp) * 2.2, 0.0, 1.0) * smoothstep(0.035, 0.0, SAFX_xx);
+      float SAFX_pr = step(SAFX_h(vec2(SAFX_col, SAFX_cz)), SAFX_cv * 0.45);
+      float SAFX_sl = 1.0 - smoothstep(0.7, 0.95, abs(SAFX_N.z));
+      float SAFX_sm = (SAFX_bulb * 0.8 + SAFX_tr * 0.35) * SAFX_pr * SAFX_sl;
+      fcolor.xyz = mix(fcolor.xyz, fcolor.xyz * 0.78 + SAFX_skyc * 0.22, SAFX_sm);
+      fcolor.xyz += (SAFX_P2.xyz * 0.5 + 0.15) * SAFX_bulb * SAFX_pr * SAFX_sl * 0.20 * (0.25 + 0.75 * SAFX_sunUp);
+    }
+  }
+)GLSL";
+
+static bool StmtEnd(const std::string& s, const char* start, size_t& endPos) {
+    size_t p = s.find(start); if (p == std::string::npos) return false;
+    size_t e = s.find(';', p); if (e == std::string::npos) return false;
+    endPos = e + 1; return true;
+}
+
+static bool PatchWorld(std::string& vs, std::string& fs, bool vehicle) {
+    if (fs.find("FogColor") == std::string::npos || fs.find("gl_FragColor = fcolor;") == std::string::npos) return false;
+    if (vs.find("void main") == std::string::npos) return false;
+    size_t wp = 0, wn = 0;
+    if (!StmtEnd(vs, "vec4 WorldPos =", wp)) return false;
+    bool hasN = StmtEnd(vs, "vec3 WorldNormal =", wn);
+    std::string insWp = "\n\tSAFX_Wp = WorldPos.xyz; SAFX_Lp = Position;\n";
+    if (!hasN) insWp += "\tSAFX_Wn = vec3(0.0, 0.0, 1.0);\n";
+    const char* insWn = "\n\tSAFX_Wn = WorldNormal;\n";
+    if (hasN && wn > wp) { vs.insert(wn, insWn); vs.insert(wp, insWp); }
+    else if (hasN) { vs.insert(wp, insWp); vs.insert(wn, insWn); }
+    else vs.insert(wp, insWp);
+    if (!InsertBeforeMain(vs, "varying highp vec3 SAFX_Wp;\nvarying mediump vec3 SAFX_Wn;\nvarying mediump vec3 SAFX_Lp;\n")) return false;
+
+    std::string body = kWCommon;
+    if (L4.giOn > 0.5f) body += kWGI;
+    if (L4.hazeOn > 0.5f) body += kWHaze;
+    if (!vehicle && L4.puddles > 0.5f) body += kWGround;
+    if (vehicle && L4.carRain > 0.5f && fs.find("Out_Tex0") != std::string::npos) body += kWCar;
+    body += "}\n";
+    if (!InsertBeforeMain(fs, kWHeader)) return false;
+    size_t gp = fs.find("gl_FragColor = fcolor;");
+    if (gp == std::string::npos) return false;
+    fs.insert(gp, body);
+    return true;
+}
+
 static uint64_t Build_hook(void* self, const char* vs, const char* fs) {
-    if (vs && fs && (C.water > 0.5f || C.wind > 0.5f)) {
-        std::string v(vs), f(fs);
-        bool water = f.find("Out_WaterDetail") != std::string::npos && v.find("Out_WaterDetail") != std::string::npos;
-        bool foliage = !water && v.find("BoneToLocal") == std::string::npos && v.find(kWorldPosAnchor) != std::string::npos
-                       && f.find("discard") != std::string::npos && f.find("EnvMapCoefficient") == std::string::npos;
-        bool changed = false;
-        if (water && C.water > 0.5f) changed = PatchWater(v, f);
-        else if (foliage && C.wind > 0.5f) changed = PatchWind(v);
-        if (changed) {
+    bool wantWorld = L4.giOn > 0.5f || L4.hazeOn > 0.5f || L4.puddles > 0.5f || L4.carRain > 0.5f;
+    if (vs && fs && (C.water > 0.5f || C.wind > 0.5f || wantWorld)) {
+        std::string v0(vs), f0(fs);
+        bool water = f0.find("Out_WaterDetail") != std::string::npos && v0.find("Out_WaterDetail") != std::string::npos;
+        bool skyVar = v0.find("ReflPos.xy = normalize") != std::string::npos;
+        bool foliage = !water && v0.find("BoneToLocal") == std::string::npos && v0.find(kWorldPosAnchor) != std::string::npos
+                       && f0.find("discard") != std::string::npos && f0.find("EnvMapCoefficient") == std::string::npos;
+        bool vehicle = f0.find("EnvMapCoefficient") != std::string::npos;
+        bool doWind = foliage && C.wind > 0.5f;
+        bool doWorld = !water && !skyVar && wantWorld && f0.find("Out_Color") != std::string::npos;
+        std::string v = v0, f = f0;
+        bool ch = false;
+        if (water && C.water > 0.5f) ch = PatchWater(v, f);
+        else {
+            if (doWind) ch |= PatchWind(v);
+            if (doWorld) ch |= PatchWorld(v, f, vehicle);
+        }
+        if (ch) {
             if (TestCompile(v.c_str(), f.c_str())) {
-                if (water) g_nWater++; else g_nWind++;
+                if (water) g_nWater++; else { if (doWind) g_nWind++; if (doWorld) { g_nWorld++; if (vehicle) g_nVeh++; } }
                 return Build_orig(self, strdup(v.c_str()), strdup(f.c_str()));
             }
             g_nPatchFail++;
+            if (doWind && doWorld) {   // reintentar solo con el viento
+                std::string v2 = v0, f2 = f0;
+                if (PatchWind(v2) && TestCompile(v2.c_str(), f2.c_str())) {
+                    g_nWind++;
+                    return Build_orig(self, strdup(v2.c_str()), strdup(f2.c_str()));
+                }
+            }
         }
     }
     return Build_orig(self, vs, fs);
@@ -1044,10 +1346,11 @@ static void Wind_hook(float v) {
 }
 
 // =============================== CARGA DEL MOD ===============================
-ON_MOD_PRELOAD() { LOG("SAFX 0.4 preload"); }
+ON_MOD_PRELOAD() { LOG("SAFX 0.5 preload"); }
 
 ON_MOD_LOAD() {
     LoadConfig3();
+    LoadConfig4();
     if (R.master < 0.5f) { LOG("desactivado en SAFX64.ini (General/Enable=0)"); return; }
     void* h = (void*)aml->GetLibHandle("libGTASA.so");
     if (!h) { LOG("no se encontro libGTASA.so"); return; }
