@@ -1082,7 +1082,8 @@ static void Swap_hook(char*& cmd) {
 
 // =============================== PARCHES DE SHADERS DEL JUEGO ===============================
 static bool TestCompile(const char* vs, const char* fs) {
-    GLuint v = glCreateShader(GL_VERTEX_SHADER); if (!v) return false;
+    GLuint v = glCreateShader(GL_VERTEX_SHADER);
+    if (!v) { static bool once = false; if (!once) { once = true; FLog("TestCompile: no hay contexto GL en este hilo (ctx=%p)", (void*)eglGetCurrentContext()); } return false; }
     GLuint f = glCreateShader(GL_FRAGMENT_SHADER);
     GLuint p = glCreateProgram();
     GLint ok = 0, ok2 = 0, ok3 = 0;
@@ -1303,7 +1304,20 @@ static bool PatchWorld(std::string& vs, std::string& fs, bool vehicle) {
     return true;
 }
 
+// ---- diagnostico: cuantas veces se llama a Build y volcado de los primeros shaders ----
+static int g_nBuildCalls = 0, g_nDumped = 0; static bool g_dumpWater = false, g_dumpVeh = false;
+static void DumpShader(const char* tag, const char* vs, const char* fs) {
+    if (g_nDumped >= 9 || !g_logPath[0]) return;
+    char pth[360]; snprintf(pth, sizeof pth, "%s", g_logPath);
+    char* s = strstr(pth, "SAFX64.log"); if (!s) return;
+    strcpy(s, "SAFX64_shaders.txt");
+    FILE* f = fopen(pth, g_nDumped == 0 ? "w" : "a"); if (!f) return;
+    fprintf(f, "\n========== %s #%d ==========\n---- VERTEX ----\n%s\n---- FRAGMENT ----\n%s\n", tag, g_nDumped, vs ? vs : "(null)", fs ? fs : "(null)");
+    fclose(f); g_nDumped++;
+}
+
 static uint64_t Build_hook(void* self, const char* vs, const char* fs) {
+    g_nBuildCalls++;
     bool wantWorld = L4.giOn > 0.5f || L4.hazeOn > 0.5f || L4.puddles > 0.5f || L4.carRain > 0.5f;
     if (vs && fs && (C.water > 0.5f || C.wind > 0.5f || wantWorld)) {
         std::string v0(vs), f0(fs);
@@ -1314,6 +1328,15 @@ static uint64_t Build_hook(void* self, const char* vs, const char* fs) {
         bool vehicle = f0.find("EnvMapCoefficient") != std::string::npos;
         bool doWind = foliage && C.wind > 0.5f;
         bool doWorld = !water && !skyVar && wantWorld && f0.find("Out_Color") != std::string::npos;
+        if (g_nBuildCalls <= 12 || g_nBuildCalls % 40 == 0)
+            FLog("Build #%d ctx=%p vs=%zu fs=%zu agua=%d cielo=%d follaje=%d vehiculo=%d mundo=%d | WorldPos=%d WorldNormal=%d FragColor=%d FogColor=%d OutColor=%d",
+                 g_nBuildCalls, (void*)eglGetCurrentContext(), v0.size(), f0.size(), water, skyVar, foliage, vehicle, doWorld,
+                 (int)(v0.find("vec4 WorldPos =") != std::string::npos), (int)(v0.find("vec3 WorldNormal =") != std::string::npos),
+                 (int)(f0.find("gl_FragColor = fcolor;") != std::string::npos), (int)(f0.find("FogColor") != std::string::npos),
+                 (int)(f0.find("Out_Color") != std::string::npos));
+        if (g_nBuildCalls <= 3) DumpShader("primeros", v0.c_str(), f0.c_str());
+        if (water && !g_dumpWater) { g_dumpWater = true; DumpShader("agua", v0.c_str(), f0.c_str()); }
+        if (vehicle && !g_dumpVeh) { g_dumpVeh = true; DumpShader("vehiculo", v0.c_str(), f0.c_str()); }
         std::string v = v0, f = f0;
         bool ch = false;
         if (water && C.water > 0.5f) ch = PatchWater(v, f);
@@ -1321,8 +1344,11 @@ static uint64_t Build_hook(void* self, const char* vs, const char* fs) {
             if (doWind) ch |= PatchWind(v);
             if (doWorld) ch |= PatchWorld(v, f, vehicle);
         }
+        if (g_nBuildCalls <= 12) FLog("   parche aplicado al texto: %d", (int)ch);
         if (ch) {
-            if (TestCompile(v.c_str(), f.c_str())) {
+            bool okc = TestCompile(v.c_str(), f.c_str());
+            if (g_nBuildCalls <= 12) FLog("   compila: %d", (int)okc);
+            if (okc) {
                 if (water) g_nWater++; else { if (doWind) g_nWind++; if (doWorld) { g_nWorld++; if (vehicle) g_nVeh++; } }
                 return Build_orig(self, strdup(v.c_str()), strdup(f.c_str()));
             }
@@ -1388,4 +1414,6 @@ ON_MOD_LOAD() {
     if (build) aml->Hook(build, (void*)Build_hook, (void**)&Build_orig); else LOG("sin ES2Shader::Build: agua/arboles desactivados");
     if (wind && C.wind > 0.5f) aml->Hook(wind, (void*)Wind_hook, (void**)&Wind_orig);
     LOG("SAFX activo (rain=%p wind=%p camera=%p calc=%p build=%p grass=%p)", pRain, pWind, pTheCamera, (void*)CalcScreen, build, wind);
+    FLog("simbolos: swap=%p renderScene=%p menu=%p build=%p viento=%p camara=%p rain=%p", swap, rscene, rmenu, build, wind, pTheCamera, (void*)pRain);
+    FLog("hooks: swap_orig=%p build_orig=%p scene_orig=%p", (void*)Swap_orig, (void*)Build_orig, (void*)RS_orig);
 }
