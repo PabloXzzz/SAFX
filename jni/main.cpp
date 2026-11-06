@@ -1112,12 +1112,23 @@ static bool InsertBeforeMain(std::string& s, const char* text) {
 
 static const char* kWorldPosAnchor = "vec4 WorldPos = ObjMatrix * vec4(Position,1.0);";
 
-static bool PatchWater(std::string& vs, std::string& fs) {
-    if (fs.find("FogColor") == std::string::npos || vs.find("CameraPosition") == std::string::npos) return false;
-    if (!InsertBeforeMain(vs, "varying mediump vec3 SAFX_View;\n")) return false;
-    if (!InsertAfter(vs, kWorldPosAnchor, "\n\tSAFX_View = WorldPos.xyz - CameraPosition.xyz;\n")) return false;
-    if (!InsertBeforeMain(fs, "varying mediump vec3 SAFX_View;\nuniform mediump vec4 SAFX_P1;\nuniform mediump vec4 SAFX_P2;\n")) return false;
-    const char* code = R"GLSL(
+static const char* kWaterHdrB = R"GLSL(
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+#define SAFX_HP highp
+#else
+#define SAFX_HP mediump
+#endif
+float SAFX_wn(SAFX_HP vec2 p){
+  SAFX_HP vec2 i = floor(p); SAFX_HP vec2 f = fract(p); f = f * f * (3.0 - 2.0 * f);
+  float a = fract(sin(dot(i, vec2(127.1, 311.7))) * 43758.5453);
+  float b = fract(sin(dot(i + vec2(1.0, 0.0), vec2(127.1, 311.7))) * 43758.5453);
+  float c = fract(sin(dot(i + vec2(0.0, 1.0), vec2(127.1, 311.7))) * 43758.5453);
+  float d = fract(sin(dot(i + vec2(1.0, 1.0), vec2(127.1, 311.7))) * 43758.5453);
+  return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+)GLSL";
+
+static const char* kWaterCodeA = R"GLSL(
 {
   vec3 SAFX_V = normalize(SAFX_View);
   float SAFX_e = 0.006;
@@ -1134,7 +1145,42 @@ static bool PatchWater(std::string& vs, std::string& fs) {
   fcolor.xyz = mix(fcolor.xyz, SAFX_sky, SAFX_F * SAFX_P2.w) + SAFX_P2.xyz * SAFX_sp * SAFX_P1.w;
 }
 )GLSL";
-    return InsertAfter(fs, "waterDetail * 1.1, Out_Color.w);", code);
+
+static const char* kWaterCodeB = R"GLSL(
+{
+  vec3 SAFX_V = normalize(SAFX_View);
+  SAFX_HP vec2 SAFX_p1 = Out_WaterDetail * 3.0;
+  SAFX_HP vec2 SAFX_p2 = Out_WaterDetail2 * 3.0 + 5.7;
+  float SAFX_e = 0.08;
+  vec2 SAFX_g = vec2(SAFX_wn(SAFX_p1 + vec2(SAFX_e, 0.0)) - SAFX_wn(SAFX_p1 - vec2(SAFX_e, 0.0)),
+                     SAFX_wn(SAFX_p1 + vec2(0.0, SAFX_e)) - SAFX_wn(SAFX_p1 - vec2(0.0, SAFX_e)));
+  SAFX_g += vec2(SAFX_wn(SAFX_p2 + vec2(SAFX_e, 0.0)) - SAFX_wn(SAFX_p2 - vec2(SAFX_e, 0.0)),
+                 SAFX_wn(SAFX_p2 + vec2(0.0, SAFX_e)) - SAFX_wn(SAFX_p2 - vec2(0.0, SAFX_e)));
+  vec3 SAFX_N = normalize(vec3(SAFX_g * 1.6, 1.0));
+  float SAFX_c = clamp(dot(-SAFX_V, SAFX_N), 0.0, 1.0);
+  float SAFX_F = 0.02 + 0.98 * pow(1.0 - SAFX_c, 5.0);
+  vec3 SAFX_R = reflect(SAFX_V, SAFX_N);
+  vec3 SAFX_sky = mix(FogColor, FogColor * 1.25 + vec3(0.04, 0.07, 0.12), clamp(SAFX_R.z * 1.5, 0.0, 1.0));
+  float SAFX_d = max(dot(SAFX_R, SAFX_P1.xyz), 0.0);
+  float SAFX_sp = pow(SAFX_d, 140.0) * 1.6 + pow(SAFX_d, 22.0) * 0.12;
+  float SAFX_nf = 1.0 - Out_FogAmt;
+  fcolor.xyz = mix(fcolor.xyz, SAFX_sky, SAFX_F * SAFX_P2.w * SAFX_nf) + SAFX_P2.xyz * SAFX_sp * SAFX_P1.w * SAFX_nf;
+}
+)GLSL";
+
+static bool PatchWater(std::string& vs, std::string& fs) {
+    if (fs.find("FogColor") == std::string::npos || vs.find("CameraPosition") == std::string::npos) return false;
+    if (!InsertBeforeMain(vs, "varying mediump vec3 SAFX_View;\n")) return false;
+    if (!InsertAfter(vs, kWorldPosAnchor, "\n\tSAFX_View = WorldPos.xyz - CameraPosition.xyz;\n")) return false;
+    bool detail = fs.find("waterDetail * 1.1, Out_Color.w);") != std::string::npos;
+    std::string hdr = "varying mediump vec3 SAFX_View;\nuniform mediump vec4 SAFX_P1;\nuniform mediump vec4 SAFX_P2;\n";
+    if (!detail) hdr += kWaterHdrB;
+    if (!InsertBeforeMain(fs, hdr.c_str())) return false;
+    if (detail) return InsertAfter(fs, "waterDetail * 1.1, Out_Color.w);", kWaterCodeA);
+    size_t gp = fs.find("gl_FragColor = fcolor;");
+    if (gp == std::string::npos) return false;
+    fs.insert(gp, kWaterCodeB);
+    return true;
 }
 
 static bool PatchWind(std::string& vs) {
@@ -1169,10 +1215,24 @@ static const char* kWCommon = R"GLSL(
 {
   vec3 SAFX_N = SAFX_Wn;
   float SAFX_nn = dot(SAFX_N, SAFX_N);
-  SAFX_N = (SAFX_nn > 0.01) ? SAFX_N * inversesqrt(SAFX_nn) : vec3(0.0, 0.0, 1.0);
   vec3 SAFX_Vw = SAFX_Wp - SAFX_Cam;
   float SAFX_D = max(length(SAFX_Vw), 0.01);
   vec3 SAFX_V = SAFX_Vw / SAFX_D;
+#ifdef GL_OES_standard_derivatives
+  vec3 SAFX_gn = cross(dFdx(SAFX_Wp), dFdy(SAFX_Wp));
+  float SAFX_gl = dot(SAFX_gn, SAFX_gn);
+#endif
+  if (SAFX_nn > 0.01) {
+    SAFX_N = SAFX_N * inversesqrt(SAFX_nn);
+  } else {
+    SAFX_N = vec3(0.0, 0.0, 1.0);
+#ifdef GL_OES_standard_derivatives
+    if (SAFX_gl > 0.0000001) {
+      SAFX_gn = SAFX_gn * inversesqrt(SAFX_gl);
+      SAFX_N = (dot(SAFX_gn, SAFX_V) > 0.0) ? -SAFX_gn : SAFX_gn;
+    }
+#endif
+  }
   float SAFX_sunUp = SAFX_P4.w;
 )GLSL";
 
@@ -1284,7 +1344,7 @@ static bool PatchWorld(std::string& vs, std::string& fs, bool vehicle) {
     if (!StmtEnd(vs, "vec4 WorldPos =", wp)) return false;
     bool hasN = StmtEnd(vs, "vec3 WorldNormal =", wn);
     std::string insWp = "\n\tSAFX_Wp = WorldPos.xyz; SAFX_Lp = Position;\n";
-    if (!hasN) insWp += "\tSAFX_Wn = vec3(0.0, 0.0, 1.0);\n";
+    if (!hasN) insWp += "\tSAFX_Wn = vec3(0.0);\n";
     const char* insWn = "\n\tSAFX_Wn = WorldNormal;\n";
     if (hasN && wn > wp) { vs.insert(wn, insWn); vs.insert(wp, insWp); }
     else if (hasN) { vs.insert(wp, insWp); vs.insert(wn, insWn); }
@@ -1301,10 +1361,11 @@ static bool PatchWorld(std::string& vs, std::string& fs, bool vehicle) {
     size_t gp = fs.find("gl_FragColor = fcolor;");
     if (gp == std::string::npos) return false;
     fs.insert(gp, body);
+    fs.insert(0, "#extension GL_OES_standard_derivatives : enable\n");
     return true;
 }
 
-// ---- diagnostico: cuantas veces se llama a Build y volcado de los primeros shaders ----
+// ---- diagnostico: cuantas veces se llama a Build y volcado de shaders ----
 static int g_nBuildCalls = 0, g_nDumped = 0; static bool g_dumpWater = false, g_dumpVeh = false;
 static void DumpShader(const char* tag, const char* vs, const char* fs) {
     if (g_nDumped >= 9 || !g_logPath[0]) return;
@@ -1316,11 +1377,15 @@ static void DumpShader(const char* tag, const char* vs, const char* fs) {
     fclose(f); g_nDumped++;
 }
 
-static uint64_t Build_hook(void* self, const char* vs, const char* fs) {
+static uint64_t Build_hook(void* self, const char* a1, const char* a2) {
     g_nBuildCalls++;
     bool wantWorld = L4.giOn > 0.5f || L4.hazeOn > 0.5f || L4.puddles > 0.5f || L4.carRain > 0.5f;
-    if (vs && fs && (C.water > 0.5f || C.wind > 0.5f || wantWorld)) {
-        std::string v0(vs), f0(fs);
+    if (a1 && a2 && (C.water > 0.5f || C.wind > 0.5f || wantWorld)) {
+        // El juego llama a Build(fragmentos, vertices). Se detecta por contenido por si cambia el orden.
+        bool a1IsVs = strstr(a1, "gl_Position") != nullptr;
+        const char* vsSrc = a1IsVs ? a1 : a2;
+        const char* fsSrc = a1IsVs ? a2 : a1;
+        std::string v0(vsSrc), f0(fsSrc);
         bool water = f0.find("Out_WaterDetail") != std::string::npos && v0.find("Out_WaterDetail") != std::string::npos;
         bool skyVar = v0.find("ReflPos.xy = normalize") != std::string::npos;
         bool foliage = !water && v0.find("BoneToLocal") == std::string::npos && v0.find(kWorldPosAnchor) != std::string::npos
@@ -1328,15 +1393,11 @@ static uint64_t Build_hook(void* self, const char* vs, const char* fs) {
         bool vehicle = f0.find("EnvMapCoefficient") != std::string::npos;
         bool doWind = foliage && C.wind > 0.5f;
         bool doWorld = !water && !skyVar && wantWorld && f0.find("Out_Color") != std::string::npos;
-        if (g_nBuildCalls <= 12 || g_nBuildCalls % 40 == 0)
-            FLog("Build #%d ctx=%p vs=%zu fs=%zu agua=%d cielo=%d follaje=%d vehiculo=%d mundo=%d | WorldPos=%d WorldNormal=%d FragColor=%d FogColor=%d OutColor=%d",
-                 g_nBuildCalls, (void*)eglGetCurrentContext(), v0.size(), f0.size(), water, skyVar, foliage, vehicle, doWorld,
+        if (g_nBuildCalls <= 6 || g_nBuildCalls % 60 == 0)
+            FLog("Build #%d orden=%s vs=%zu fs=%zu agua=%d follaje=%d vehiculo=%d mundo=%d | WorldPos=%d WorldNormal=%d FragColor=%d FogColor=%d",
+                 g_nBuildCalls, a1IsVs ? "VS,FS" : "FS,VS", v0.size(), f0.size(), water, foliage, vehicle, doWorld,
                  (int)(v0.find("vec4 WorldPos =") != std::string::npos), (int)(v0.find("vec3 WorldNormal =") != std::string::npos),
-                 (int)(f0.find("gl_FragColor = fcolor;") != std::string::npos), (int)(f0.find("FogColor") != std::string::npos),
-                 (int)(f0.find("Out_Color") != std::string::npos));
-        if (g_nBuildCalls <= 3) DumpShader("primeros", v0.c_str(), f0.c_str());
-        if (water && !g_dumpWater) { g_dumpWater = true; DumpShader("agua", v0.c_str(), f0.c_str()); }
-        if (vehicle && !g_dumpVeh) { g_dumpVeh = true; DumpShader("vehiculo", v0.c_str(), f0.c_str()); }
+                 (int)(f0.find("gl_FragColor = fcolor;") != std::string::npos), (int)(f0.find("FogColor") != std::string::npos));
         std::string v = v0, f = f0;
         bool ch = false;
         if (water && C.water > 0.5f) ch = PatchWater(v, f);
@@ -1344,25 +1405,27 @@ static uint64_t Build_hook(void* self, const char* vs, const char* fs) {
             if (doWind) ch |= PatchWind(v);
             if (doWorld) ch |= PatchWorld(v, f, vehicle);
         }
-        if (g_nBuildCalls <= 12) FLog("   parche aplicado al texto: %d", (int)ch);
         if (ch) {
             bool okc = TestCompile(v.c_str(), f.c_str());
-            if (g_nBuildCalls <= 12) FLog("   compila: %d", (int)okc);
             if (okc) {
                 if (water) g_nWater++; else { if (doWind) g_nWind++; if (doWorld) { g_nWorld++; if (vehicle) g_nVeh++; } }
-                return Build_orig(self, strdup(v.c_str()), strdup(f.c_str()));
+                if (g_nWorld + g_nWater <= 3) DumpShader(water ? "parchado agua" : (vehicle ? "parchado vehiculo" : "parchado mundo"), v.c_str(), f.c_str());
+                const char* nv = strdup(v.c_str()); const char* nf = strdup(f.c_str());
+                return a1IsVs ? Build_orig(self, nv, nf) : Build_orig(self, nf, nv);
             }
             g_nPatchFail++;
+            if (g_nPatchFail <= 3) DumpShader("rechazado", v.c_str(), f.c_str());
             if (doWind && doWorld) {   // reintentar solo con el viento
                 std::string v2 = v0, f2 = f0;
                 if (PatchWind(v2) && TestCompile(v2.c_str(), f2.c_str())) {
                     g_nWind++;
-                    return Build_orig(self, strdup(v2.c_str()), strdup(f2.c_str()));
+                    const char* nv = strdup(v2.c_str()); const char* nf = strdup(f2.c_str());
+                    return a1IsVs ? Build_orig(self, nv, nf) : Build_orig(self, nf, nv);
                 }
             }
         }
     }
-    return Build_orig(self, vs, fs);
+    return Build_orig(self, a1, a2);
 }
 
 // Viento en pasto/plantas: amplifica la inclinacion que calcula el juego
