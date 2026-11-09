@@ -1218,18 +1218,23 @@ static const char* kWCommon = R"GLSL(
   vec3 SAFX_Vw = SAFX_Wp - SAFX_Cam;
   float SAFX_D = max(length(SAFX_Vw), 0.01);
   vec3 SAFX_V = SAFX_Vw / SAFX_D;
+  float SAFX_nOK = 0.0;
 #ifdef GL_OES_standard_derivatives
-  vec3 SAFX_gn = cross(dFdx(SAFX_Wp), dFdy(SAFX_Wp));
-  float SAFX_gl = dot(SAFX_gn, SAFX_gn);
+  SAFX_HP vec3 SAFX_dx = dFdx(SAFX_Wp) * 16.0;
+  SAFX_HP vec3 SAFX_dy = dFdy(SAFX_Wp) * 16.0;
+  SAFX_HP vec3 SAFX_gn = cross(SAFX_dx, SAFX_dy);
+  SAFX_HP float SAFX_gl = dot(SAFX_gn, SAFX_gn);
 #endif
   if (SAFX_nn > 0.01) {
     SAFX_N = SAFX_N * inversesqrt(SAFX_nn);
+    SAFX_nOK = 1.0;
   } else {
-    SAFX_N = vec3(0.0, 0.0, 1.0);
+    SAFX_N = vec3(0.0);
 #ifdef GL_OES_standard_derivatives
-    if (SAFX_gl > 0.0000001) {
+    if (SAFX_gl > 1.0e-12) {
       SAFX_gn = SAFX_gn * inversesqrt(SAFX_gl);
       SAFX_N = (dot(SAFX_gn, SAFX_V) > 0.0) ? -SAFX_gn : SAFX_gn;
+      SAFX_nOK = 1.0;
     }
 #endif
   }
@@ -1238,8 +1243,10 @@ static const char* kWCommon = R"GLSL(
 
 static const char* kWGI = R"GLSL(
   {
-    float SAFX_gk = SAFX_P4.x * smoothstep(0.0, 0.35, SAFX_sunUp);
-    float SAFX_lit = smoothstep(-0.15, 0.55, dot(SAFX_N, SAFX_P1.xyz));
+    float SAFX_gk = SAFX_P4.x * smoothstep(0.0, 0.35, SAFX_sunUp) * SAFX_nOK;
+    float SAFX_lw = smoothstep(-0.15, 0.55, dot(SAFX_N, SAFX_P1.xyz));
+    float SAFX_lu = smoothstep(-0.15, 0.55, SAFX_P1.z);
+    float SAFX_lit = mix(SAFX_lw, SAFX_lu, smoothstep(0.70, 0.95, SAFX_N.z));
     vec3 SAFX_hs = FogColor * 1.1 + vec3(0.02, 0.04, 0.08);
     vec3 SAFX_hg = vec3(0.30, 0.26, 0.22) * (0.4 + 0.6 * SAFX_sunUp);
     vec3 SAFX_am = mix(SAFX_hg, SAFX_hs, SAFX_N.z * 0.5 + 0.5);
@@ -1259,12 +1266,12 @@ static const char* kWHaze = R"GLSL(
 )GLSL";
 
 static const char* kWGround = R"GLSL(
-  if (SAFX_P3.x > 0.01 && SAFX_N.z > 0.75) {
+  if (SAFX_nOK > 0.5 && SAFX_P3.x > 0.01 && SAFX_N.z > 0.9) {
     float SAFX_W = SAFX_P3.x;
-    float SAFX_up = smoothstep(0.75, 0.95, SAFX_N.z);
+    float SAFX_up = smoothstep(0.90, 0.98, SAFX_N.z);
     float SAFX_pn = SAFX_n(SAFX_Wp.xy * 0.22) * 0.65 + SAFX_n(SAFX_Wp.xy * 0.9) * 0.35;
-    float SAFX_pd = smoothstep(0.70 - 0.40 * SAFX_W, 0.80 - 0.40 * SAFX_W, SAFX_pn) * SAFX_up;
-    fcolor.xyz *= 1.0 - (0.28 * SAFX_W * SAFX_up + 0.30 * SAFX_pd);
+    float SAFX_pd = smoothstep(0.80 - 0.18 * SAFX_W, 0.87 - 0.18 * SAFX_W, SAFX_pn) * SAFX_up;
+    fcolor.xyz *= 1.0 - (0.22 * SAFX_W * SAFX_up + 0.28 * SAFX_pd);
     vec2 SAFX_rp = vec2(0.0);
     float SAFX_rg = 0.0;
     if (SAFX_P5.y > 0.5 && SAFX_P3.z > 0.02 && SAFX_pd > 0.01) {
@@ -1279,14 +1286,15 @@ static const char* kWGround = R"GLSL(
     vec3 SAFX_R = reflect(SAFX_V, vec3(0.0, 0.0, 1.0));
     SAFX_HP vec4 SAFX_c = SAFX_VP * vec4(SAFX_Wp + SAFX_R * 28.0, 1.0);
     vec2 SAFX_uv = SAFX_c.xy / SAFX_c.w * 0.5 + 0.5 + SAFX_rp;
-    vec2 SAFX_e = min(SAFX_uv, 1.0 - SAFX_uv);
-    float SAFX_vis = (SAFX_c.w > 0.1) ? smoothstep(0.0, 0.16, min(SAFX_e.x, SAFX_e.y)) : 0.0;
+    float SAFX_mu = smoothstep(0.14, 0.24, SAFX_uv.x) * smoothstep(0.86, 0.76, SAFX_uv.x);
+    float SAFX_mv = smoothstep(0.04, 0.16, SAFX_uv.y) * smoothstep(0.78, 0.66, SAFX_uv.y);
+    float SAFX_vis = (SAFX_c.w > 0.1) ? SAFX_mu * SAFX_mv : 0.0;
     vec3 SAFX_rc = texture2D(SAFX_Refl, clamp(SAFX_uv, 0.003, 0.997)).rgb;
     vec3 SAFX_sk = mix(FogColor, FogColor * 1.25 + vec3(0.04, 0.07, 0.12), clamp(SAFX_R.z * 1.5, 0.0, 1.0)) * 1.4;
     SAFX_rc = mix(SAFX_sk, SAFX_rc, SAFX_vis);
     float SAFX_F = 0.04 + 0.96 * pow(1.0 - clamp(-SAFX_V.z, 0.0, 1.0), 5.0);
-    fcolor.xyz = mix(fcolor.xyz, SAFX_rc, clamp(SAFX_pd * (0.30 + 0.70 * SAFX_F) * SAFX_P5.x, 0.0, 0.92));
-    fcolor.xyz += SAFX_P2.xyz * (pow(max(dot(SAFX_R, SAFX_P1.xyz), 0.0), 90.0) * SAFX_pd * SAFX_sunUp * 1.5 + SAFX_rg * 0.12);
+    fcolor.xyz = mix(fcolor.xyz, SAFX_rc, clamp(SAFX_pd * (0.30 + 0.70 * SAFX_F) * SAFX_P5.x, 0.0, 0.90));
+    fcolor.xyz += SAFX_P2.xyz * (pow(max(dot(SAFX_R, SAFX_P1.xyz), 0.0), 90.0) * SAFX_pd * SAFX_sunUp * 1.2 + SAFX_rg * 0.10);
   }
 )GLSL";
 
@@ -1299,18 +1307,18 @@ static const char* kWCar = R"GLSL(
     float SAFX_h1 = SAFX_h(SAFX_bi);
     float SAFX_h2 = SAFX_h(SAFX_bi + 17.3);
     float SAFX_h3 = SAFX_h(SAFX_bi + 41.7);
-    float SAFX_on = step(SAFX_h1, SAFX_cv * 0.75);
-    vec2 SAFX_of = (vec2(SAFX_h2, SAFX_h3) - 0.5) * 0.45;
-    float SAFX_r = 0.10 + 0.16 * SAFX_h2;
+    float SAFX_on = step(SAFX_h1, SAFX_cv * 0.55);
+    vec2 SAFX_of = (vec2(SAFX_h2, SAFX_h3) - 0.5) * 0.40;
+    float SAFX_r = 0.07 + 0.12 * SAFX_h2;
     float SAFX_d = length(SAFX_bf - SAFX_of);
     float SAFX_body = smoothstep(SAFX_r, SAFX_r * 0.72, SAFX_d) * SAFX_on;
     float SAFX_rim = (smoothstep(SAFX_r, SAFX_r * 0.78, SAFX_d) - smoothstep(SAFX_r * 0.78, SAFX_r * 0.50, SAFX_d)) * SAFX_on;
     vec2 SAFX_hl = (SAFX_bf - SAFX_of) / SAFX_r;
-    float SAFX_sp = smoothstep(0.55, 0.0, length(SAFX_hl - vec2(-0.35, 0.40))) * SAFX_body;
+    float SAFX_sp = smoothstep(0.35, 0.0, length(SAFX_hl - vec2(-0.30, 0.35))) * SAFX_body;
     vec3 SAFX_skyc = FogColor * 1.4;
-    fcolor.xyz = mix(fcolor.xyz, fcolor.xyz * 0.80 + SAFX_skyc * 0.20, SAFX_body * 0.45);
-    fcolor.xyz *= 1.0 - 0.30 * SAFX_rim;
-    fcolor.xyz += (SAFX_P2.xyz * 0.6 + 0.2) * SAFX_sp * (0.25 + 0.75 * SAFX_sunUp);
+    fcolor.xyz = mix(fcolor.xyz, fcolor.xyz * 0.75 + SAFX_skyc * 0.12, SAFX_body * 0.35);
+    fcolor.xyz *= 1.0 - 0.40 * SAFX_rim;
+    fcolor.xyz += (SAFX_P2.xyz * 0.5 + 0.1) * SAFX_sp * 0.22 * (0.25 + 0.75 * SAFX_sunUp);
     if (SAFX_P5.w > 0.5) {
       SAFX_HP vec2 SAFX_su = vec2(SAFX_Lp.x * 6.0 + SAFX_Lp.y * 4.1, SAFX_Lp.z * 2.2);
       SAFX_HP float SAFX_col = floor(SAFX_su.x);
@@ -1319,14 +1327,14 @@ static const char* kWCar = R"GLSL(
       float SAFX_fz = fract(SAFX_su.y);
       float SAFX_hp = 1.0 - fract(SAFX_sh * 7.0 + SAFX_P3.w * (0.05 + 0.09 * SAFX_sh));
       float SAFX_xx = abs(fract(SAFX_su.x) - 0.5 - (SAFX_sh - 0.5) * 0.4);
-      float SAFX_ln = smoothstep(0.07, 0.0, SAFX_xx);
-      float SAFX_bulb = smoothstep(0.07, 0.0, abs(SAFX_fz - SAFX_hp)) * SAFX_ln;
-      float SAFX_tr = step(SAFX_hp, SAFX_fz) * clamp(1.0 - (SAFX_fz - SAFX_hp) * 2.2, 0.0, 1.0) * smoothstep(0.035, 0.0, SAFX_xx);
-      float SAFX_pr = step(SAFX_h(vec2(SAFX_col, SAFX_cz)), SAFX_cv * 0.45);
-      float SAFX_sl = 1.0 - smoothstep(0.7, 0.95, abs(SAFX_N.z));
-      float SAFX_sm = (SAFX_bulb * 0.8 + SAFX_tr * 0.35) * SAFX_pr * SAFX_sl;
-      fcolor.xyz = mix(fcolor.xyz, fcolor.xyz * 0.78 + SAFX_skyc * 0.22, SAFX_sm);
-      fcolor.xyz += (SAFX_P2.xyz * 0.5 + 0.15) * SAFX_bulb * SAFX_pr * SAFX_sl * 0.20 * (0.25 + 0.75 * SAFX_sunUp);
+      float SAFX_ln = smoothstep(0.05, 0.0, SAFX_xx);
+      float SAFX_bulb = smoothstep(0.06, 0.0, abs(SAFX_fz - SAFX_hp)) * SAFX_ln;
+      float SAFX_tr = step(SAFX_hp, SAFX_fz) * clamp(1.0 - (SAFX_fz - SAFX_hp) * 2.2, 0.0, 1.0) * smoothstep(0.025, 0.0, SAFX_xx);
+      float SAFX_pr = step(SAFX_h(vec2(SAFX_col, SAFX_cz)), SAFX_cv * 0.30);
+      float SAFX_sl = (1.0 - smoothstep(0.7, 0.95, abs(SAFX_N.z))) * SAFX_nOK;
+      float SAFX_sm = (SAFX_bulb * 0.7 + SAFX_tr * 0.25) * SAFX_pr * SAFX_sl;
+      fcolor.xyz = mix(fcolor.xyz, fcolor.xyz * 0.80 + SAFX_skyc * 0.12, SAFX_sm);
+      fcolor.xyz += (SAFX_P2.xyz * 0.4 + 0.1) * SAFX_bulb * SAFX_pr * SAFX_sl * 0.10 * (0.25 + 0.75 * SAFX_sunUp);
     }
   }
 )GLSL";
