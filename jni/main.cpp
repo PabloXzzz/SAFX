@@ -805,6 +805,7 @@ struct Cfg4 {
     float giOn = 1, giStrength = 0.7f, hazeOn = 1, hazeDensity = 0.0009f, hazeFalloff = 0.03f;
     float puddles = 1, puddleRefl = 0.85f, ripples = 1, dryGround = 240.f;
     float carRain = 1, carStrength = 1.f, carStreaks = 1, dryCar = 120.f;
+    float carDensity = 1.6f, splash = 1.f, whitecaps = 0.6f;
 } L4;
 static int g_nWorld = 0, g_nVeh = 0;
 static char g_logPath[340] = ""; static int g_logLines = 0;
@@ -817,8 +818,9 @@ static void FLog(const char* fmt, ...) {      // registro en <configs>/SAFX64.lo
 static Ent kEnt2[] = {
     {"Lighting","Enable",&L4.giOn},{"Lighting","Strength",&L4.giStrength},
     {"Haze","Enable",&L4.hazeOn},{"Haze","Density",&L4.hazeDensity},{"Haze","HeightFalloff",&L4.hazeFalloff},
-    {"Puddles","Enable",&L4.puddles},{"Puddles","Reflection",&L4.puddleRefl},{"Puddles","Ripples",&L4.ripples},{"Puddles","DryTime",&L4.dryGround},
-    {"VehicleRain","Enable",&L4.carRain},{"VehicleRain","Strength",&L4.carStrength},{"VehicleRain","Streaks",&L4.carStreaks},{"VehicleRain","DryTime",&L4.dryCar},
+    {"Puddles","Enable",&L4.puddles},{"Puddles","Reflection",&L4.puddleRefl},{"Puddles","Ripples",&L4.ripples},{"Puddles","DryTime",&L4.dryGround},{"Puddles","Splash",&L4.splash},
+    {"VehicleRain","Enable",&L4.carRain},{"VehicleRain","Strength",&L4.carStrength},{"VehicleRain","Streaks",&L4.carStreaks},{"VehicleRain","DryTime",&L4.dryCar},{"VehicleRain","Density",&L4.carDensity},
+    {"WaterFX","Whitecaps",&L4.whitecaps},
 };
 static void LoadConfig4() {
     const int NE = (int)(sizeof(kEnt) / sizeof(kEnt[0]));
@@ -871,8 +873,8 @@ static void LoadConfig4() {
 }
 
 // ---- uniformes SAFX_* que los shaders parcheados del juego necesitan cada frame ----
-struct GP2 { GLuint id; GLint u[9]; };   // 0..5 = P0..P5, 6 = Cam, 7 = VP, 8 = Refl
-static const char* kUN[9] = { "SAFX_P0", "SAFX_P1", "SAFX_P2", "SAFX_P3", "SAFX_P4", "SAFX_P5", "SAFX_Cam", "SAFX_VP", "SAFX_Refl" };
+struct GP2 { GLuint id; GLint u[10]; };   // 0..5 = P0..P5, 6 = Cam, 7 = VP, 8 = Refl, 9 = P6
+static const char* kUN[10] = { "SAFX_P0", "SAFX_P1", "SAFX_P2", "SAFX_P3", "SAFX_P4", "SAFX_P5", "SAFX_Cam", "SAFX_VP", "SAFX_Refl", "SAFX_P6" };
 static GP2 gP2[200]; static int gNP2 = 0;
 static void RescanPrograms2() {
     for (GLuint p = 1; p <= 3000 && gNP2 < 200; p++) {
@@ -881,7 +883,7 @@ static void RescanPrograms2() {
         for (int i = 0; i < gNP2; i++) if (gP2[i].id == p) { known = true; break; }
         if (known) continue;
         GP2 g; g.id = p; bool any = false;
-        for (int k = 0; k < 9; k++) { g.u[k] = glGetUniformLocation(p, kUN[k]); if (g.u[k] >= 0) any = true; }
+        for (int k = 0; k < 10; k++) { g.u[k] = glGetUniformLocation(p, kUN[k]); if (g.u[k] >= 0) any = true; }
         if (any) gP2[gNP2++] = g;
     }
     while (glGetError() != GL_NO_ERROR) {}
@@ -903,7 +905,103 @@ static void UploadGameUniforms2(const float* VP, const float* camPos, float wetG
         if (g.u[6] >= 0 && camPos) glUniform3f(g.u[6], camPos[0], camPos[1], camPos[2]);
         if (g.u[7] >= 0 && VP) glUniformMatrix4fv(g.u[7], 1, GL_FALSE, VP);
         if (g.u[8] >= 0) glUniform1i(g.u[8], 6);
+        if (g.u[9] >= 0) glUniform4f(g.u[9], L4.carDensity, L4.splash, L4.whitecaps, 0.f);
     }
+}
+
+// ---- lluvia 3D v2: las gotas muy cercanas a la camara se desvanecen (evita la "textura" en primera persona) ----
+static const char* kVSRain2 = R"GLSL(
+attribute vec4 aSeed;
+uniform mat4 uVP; uniform vec3 uCam; uniform vec4 uP; uniform vec3 uVel; uniform vec3 uQ;
+varying float vA;
+void main(){
+  vec3 box = vec3(uP.z, uP.z, uP.w);
+  vec3 p = aSeed.xyz * box + uVel * uP.x;
+  p = p - box * floor(p / box);
+  p -= box * 0.5;
+  float dist3 = length(p);
+  vec3 head = uCam + p;
+  vec3 tail = head - normalize(uVel) * uQ.x;
+  vec4 h = uVP * vec4(head, 1.0);
+  vec4 t = uVP * vec4(tail, 1.0);
+  float along = step(1.5, aSeed.w);
+  float side = mod(aSeed.w, 2.0) * 2.0 - 1.0;
+  vec4 c = mix(h, t, along);
+  vec2 d = t.xy / t.w - h.xy / h.w;
+  float dl = length(d);
+  d = (dl > 0.00001) ? d / dl : vec2(0.0, 1.0);
+  vec2 n = vec2(-d.y, d.x) * vec2(1.0 / uQ.z, 1.0);
+  c.xy += n * side * uQ.y * c.w;
+  gl_Position = c;
+  float dist = length(p.xy) / (uP.z * 0.5);
+  float nearF = smoothstep(2.0, 7.0, dist3);
+  vA = (1.0 - smoothstep(0.6, 1.0, dist)) * (1.0 - 0.55 * along) * nearF;
+}
+)GLSL";
+static GLuint gRainProg2 = 0, gRainVbo2 = 0, gRainIbo2 = 0; static int gRainN2 = 0; static bool gRainFailed2 = false;
+static GLint r2VP = -1, r2Cam = -1, r2P = -1, r2Vel = -1, r2Q = -1, r2Col = -1;
+static bool InitRain2() {
+    GLuint v = Compile(GL_VERTEX_SHADER, kVSRain2), f = Compile(GL_FRAGMENT_SHADER, kFSRain);
+    if (!v || !f) return false;
+    gRainProg2 = glCreateProgram();
+    glAttachShader(gRainProg2, v); glAttachShader(gRainProg2, f);
+    glBindAttribLocation(gRainProg2, 0, "aSeed");
+    glLinkProgram(gRainProg2);
+    GLint ok = 0; glGetProgramiv(gRainProg2, GL_LINK_STATUS, &ok);
+    if (!ok) { FLog("lluvia v2: link fallo"); return false; }
+    r2VP = glGetUniformLocation(gRainProg2, "uVP"); r2Cam = glGetUniformLocation(gRainProg2, "uCam");
+    r2P = glGetUniformLocation(gRainProg2, "uP"); r2Vel = glGetUniformLocation(gRainProg2, "uVel");
+    r2Q = glGetUniformLocation(gRainProg2, "uQ"); r2Col = glGetUniformLocation(gRainProg2, "uCol");
+    int n = (int)R.drops; if (n < 100) n = 100; if (n > 8000) n = 8000;
+    gRainN2 = n;
+    float* vt = (float*)malloc(sizeof(float) * 16 * n);
+    unsigned short* ix = (unsigned short*)malloc(sizeof(unsigned short) * 6 * n);
+    if (!vt || !ix) { free(vt); free(ix); return false; }
+    srand(777);
+    for (int i = 0; i < n; i++) {
+        float rx = rand() / (float)RAND_MAX, ry = rand() / (float)RAND_MAX, rz = rand() / (float)RAND_MAX;
+        for (int k = 0; k < 4; k++) { float* q = vt + (i * 4 + k) * 4; q[0] = rx; q[1] = ry; q[2] = rz; q[3] = (float)k; }
+        unsigned short b = (unsigned short)(i * 4);
+        unsigned short* t = ix + i * 6;
+        t[0] = b; t[1] = (unsigned short)(b + 1); t[2] = (unsigned short)(b + 2);
+        t[3] = (unsigned short)(b + 1); t[4] = (unsigned short)(b + 3); t[5] = (unsigned short)(b + 2);
+    }
+    glGenBuffers(1, &gRainVbo2); glBindBuffer(GL_ARRAY_BUFFER, gRainVbo2);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(float) * 16 * n, vt, GL_STATIC_DRAW);
+    glGenBuffers(1, &gRainIbo2); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gRainIbo2);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(unsigned short) * 6 * n, ix, GL_STATIC_DRAW);
+    free(vt); free(ix);
+    FLog("lluvia 3D v2 lista: %d gotas", n);
+    return true;
+}
+static bool DrawRain3D2(const float* cam, float amount, float aspect, float windX, float windY, float windS, float t) {
+    if (gRainFailed2) return false;
+    float VP[16];
+    if (!GetViewProj(VP, cam + 12)) return false;
+    if (!gRainProg2) { if (!InitRain2()) { gRainFailed2 = true; return false; } }
+    int count = (int)(gRainN2 * clamp01(amount));
+    if (count < 8) return true;
+    GLint df = 0, eb = 0;
+    glGetIntegerv(GL_DEPTH_FUNC, &df); glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &eb);
+    glDisable(GL_CULL_FACE); glDisable(GL_SCISSOR_TEST); glDisable(GL_STENCIL_TEST);
+    glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LEQUAL); glDepthMask(GL_FALSE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+    float drift = 1.0f + windS * 8.0f;
+    glUseProgram(gRainProg2);
+    glUniformMatrix4fv(r2VP, 1, GL_FALSE, VP);
+    glUniform3f(r2Cam, cam[12], cam[13], cam[14]);
+    glUniform4f(r2P, t, 0.f, R.radius * 2.f, 26.f);
+    glUniform3f(r2Vel, windX * drift, windY * drift, -R.speed);
+    glUniform3f(r2Q, R.length, 0.0010f * R.width, aspect);
+    glUniform3f(r2Col, 0.72f * R.bright, 0.80f * R.bright, 0.92f * R.bright);
+    glBindBuffer(GL_ARRAY_BUFFER, gRainVbo2); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gRainIbo2);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 16, (const void*)0);
+    glDrawElements(GL_TRIANGLES, count * 6, GL_UNSIGNED_SHORT, (const void*)0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, (GLuint)eb);
+    glDepthFunc((GLenum)df);
+    return true;
 }
 
 static void RunFX() {
@@ -928,6 +1026,15 @@ static void RunFX() {
     int w, h; ScreenSize(w, h);
     if (w < 64 || h < 64) return;
     UpdateFrameState();
+    // suavizar el vector del sol y el aviso de nubes: el juego los cambia a saltos y eso causaba parpadeos
+    static bool sInit = false; static float ssx = 0, ssy = 0, ssz = 1, sBlk = 0; static double sT = 0;
+    double nowS = NowSec(); float dts = sInit ? fminf((float)(nowS - sT), 0.25f) : 1.f; sT = nowS;
+    float ks = 1.f - expf(-dts * 3.0f);
+    if (!sInit) { ssx = F.sunX; ssy = F.sunY; ssz = F.sunZ; sBlk = *pSunBlocked ? 1.f : 0.f; sInit = true; }
+    else { ssx += (F.sunX - ssx) * ks; ssy += (F.sunY - ssy) * ks; ssz += (F.sunZ - ssz) * ks;
+           sBlk += ((*pSunBlocked ? 1.f : 0.f) - sBlk) * (1.f - expf(-dts * 4.0f)); }
+    { float ln = sqrtf(ssx * ssx + ssy * ssy + ssz * ssz); if (ln > 0.001f) { ssx /= ln; ssy /= ln; ssz /= ln; } }
+    F.sunX = ssx; F.sunY = ssy; F.sunZ = ssz; F.sunUp = clamp01(ssz * 3.0f);
 
     float u = 0.5f, v = 0.5f, vis = 0.f;
     float cam[16]; bool camOK = ReadCamera(cam);
@@ -946,7 +1053,7 @@ static void RunFX() {
 
     float ex = fmaxf(fmaxf(-u, u - 1.f), 0.f), ey = fmaxf(fmaxf(-v, v - 1.f), 0.f);
     float edge = 1.f - smooth(0.f, 0.45f, fmaxf(ex, ey));
-    float blockedK = *pSunBlocked ? 1.f : 0.f;
+    float blockedK = sBlk;
     float rayK   = C.godRays > 0.5f ? C.rayInt * F.sunUp * vis * edge * (1.f - 0.65f * blockedK) : 0.f;
     float flareK = C.flare   > 0.5f ? C.flareInt * F.sunUp * vis * edge * (1.f - 0.80f * blockedK) : 0.f;
     float bloomK = C.bloom   > 0.5f ? C.bloomInt : 0.f;
@@ -1016,7 +1123,7 @@ static void RunFX() {
     // lluvia 3D (se dibuja antes del post-proceso para que reciba bloom y color)
     bool rain3dDone = false;
     if (R.rain3d > 0.5f && C.rain > 0.5f && camOK && envK * rainRaw > 0.01f)
-        rain3dDone = DrawRain3D(cam, rainRaw * envK, (float)w / (float)h, F.windX, F.windY,
+        rain3dDone = DrawRain3D2(cam, rainRaw * envK, (float)w / (float)h, F.windX, F.windY,
                                 pWind ? fminf(fmaxf(*pWind, 0.f), 1.5f) : 0.3f, F.t);
     float rainShown = rain3dDone ? 0.f : rainK;
 
@@ -1078,7 +1185,7 @@ static void RunFX() {
 static void Swap_hook(char*& cmd) {
     if (!gFailed) RunFX();
     Swap_orig(cmd);
-} 
+}
 
 // =============================== PARCHES DE SHADERS DEL JUEGO ===============================
 static bool TestCompile(const char* vs, const char* fs) {
@@ -1141,8 +1248,14 @@ static const char* kWaterCodeA = R"GLSL(
   vec3 SAFX_R = reflect(SAFX_V, SAFX_N);
   vec3 SAFX_sky = mix(FogColor, FogColor * 1.25 + vec3(0.04, 0.07, 0.12), clamp(SAFX_R.z * 1.5, 0.0, 1.0));
   float SAFX_d = max(dot(SAFX_R, SAFX_P1.xyz), 0.0);
-  float SAFX_sp = pow(SAFX_d, 140.0) * 1.6 + pow(SAFX_d, 22.0) * 0.12;
-  fcolor.xyz = mix(fcolor.xyz, SAFX_sky, SAFX_F * SAFX_P2.w) + SAFX_P2.xyz * SAFX_sp * SAFX_P1.w;
+  float SAFX_sp = pow(SAFX_d, 260.0) * 2.4 + pow(SAFX_d, 36.0) * 0.16;
+  float SAFX_cr = texture2D(EnvMap, Out_WaterDetail * 0.5, -1.0).x;
+  float SAFX_foam = smoothstep(0.66, 0.84, SAFX_cr) * SAFX_P6.z * (1.0 - SAFX_F);
+  vec3 SAFX_deep = vec3(0.01, 0.11, 0.19);
+  fcolor.xyz = mix(fcolor.xyz, SAFX_deep + fcolor.xyz * 0.40, 0.30);
+  fcolor.xyz = mix(fcolor.xyz, SAFX_sky, SAFX_F * SAFX_P2.w);
+  fcolor.xyz = mix(fcolor.xyz, vec3(0.90, 0.95, 1.0) * (0.45 + 0.55 * SAFX_P4.w), SAFX_foam * 0.65);
+  fcolor.xyz += SAFX_P2.xyz * SAFX_sp * SAFX_P1.w;
 }
 )GLSL";
 
@@ -1156,15 +1269,22 @@ static const char* kWaterCodeB = R"GLSL(
                      SAFX_wn(SAFX_p1 + vec2(0.0, SAFX_e)) - SAFX_wn(SAFX_p1 - vec2(0.0, SAFX_e)));
   SAFX_g += vec2(SAFX_wn(SAFX_p2 + vec2(SAFX_e, 0.0)) - SAFX_wn(SAFX_p2 - vec2(SAFX_e, 0.0)),
                  SAFX_wn(SAFX_p2 + vec2(0.0, SAFX_e)) - SAFX_wn(SAFX_p2 - vec2(0.0, SAFX_e)));
-  vec3 SAFX_N = normalize(vec3(SAFX_g * 1.6, 1.0));
+  vec3 SAFX_N = normalize(vec3(SAFX_g * 1.8, 1.0));
   float SAFX_c = clamp(dot(-SAFX_V, SAFX_N), 0.0, 1.0);
   float SAFX_F = 0.02 + 0.98 * pow(1.0 - SAFX_c, 5.0);
   vec3 SAFX_R = reflect(SAFX_V, SAFX_N);
   vec3 SAFX_sky = mix(FogColor, FogColor * 1.25 + vec3(0.04, 0.07, 0.12), clamp(SAFX_R.z * 1.5, 0.0, 1.0));
   float SAFX_d = max(dot(SAFX_R, SAFX_P1.xyz), 0.0);
-  float SAFX_sp = pow(SAFX_d, 140.0) * 1.6 + pow(SAFX_d, 22.0) * 0.12;
+  float SAFX_gl = 0.6 + 0.8 * SAFX_wn(SAFX_p1 * 6.0 + vec2(SAFX_P3.w * 0.7, 0.0));
+  float SAFX_sp = pow(SAFX_d, 380.0) * 3.0 * SAFX_gl + pow(SAFX_d, 40.0) * 0.18;
   float SAFX_nf = 1.0 - Out_FogAmt;
-  fcolor.xyz = mix(fcolor.xyz, SAFX_sky, SAFX_F * SAFX_P2.w * SAFX_nf) + SAFX_P2.xyz * SAFX_sp * SAFX_P1.w * SAFX_nf;
+  float SAFX_cr = SAFX_wn(SAFX_p1 * 0.7 + vec2(SAFX_P3.w * 0.04, 0.0)) * 0.6 + SAFX_wn(SAFX_p2 * 1.3 + vec2(0.0, SAFX_P3.w * 0.03)) * 0.4;
+  float SAFX_foam = smoothstep(0.66, 0.84, SAFX_cr) * SAFX_P6.z * (1.0 - SAFX_F) * SAFX_nf;
+  vec3 SAFX_deep = vec3(0.01, 0.11, 0.19);
+  fcolor.xyz = mix(fcolor.xyz, SAFX_deep + fcolor.xyz * 0.40, 0.30 * SAFX_nf);
+  fcolor.xyz = mix(fcolor.xyz, SAFX_sky, SAFX_F * SAFX_P2.w * SAFX_nf);
+  fcolor.xyz = mix(fcolor.xyz, vec3(0.90, 0.95, 1.0) * (0.45 + 0.55 * SAFX_P4.w), SAFX_foam * 0.65);
+  fcolor.xyz += SAFX_P2.xyz * SAFX_sp * SAFX_P1.w * SAFX_nf;
 }
 )GLSL";
 
@@ -1173,7 +1293,7 @@ static bool PatchWater(std::string& vs, std::string& fs) {
     if (!InsertBeforeMain(vs, "varying mediump vec3 SAFX_View;\n")) return false;
     if (!InsertAfter(vs, kWorldPosAnchor, "\n\tSAFX_View = WorldPos.xyz - CameraPosition.xyz;\n")) return false;
     bool detail = fs.find("waterDetail * 1.1, Out_Color.w);") != std::string::npos;
-    std::string hdr = "varying mediump vec3 SAFX_View;\nuniform mediump vec4 SAFX_P1;\nuniform mediump vec4 SAFX_P2;\n";
+    std::string hdr = "varying mediump vec3 SAFX_View;\nuniform mediump vec4 SAFX_P1;\nuniform mediump vec4 SAFX_P2;\nuniform mediump vec4 SAFX_P3;\nuniform mediump vec4 SAFX_P4;\nuniform mediump vec4 SAFX_P6;\n";
     if (!detail) hdr += kWaterHdrB;
     if (!InsertBeforeMain(fs, hdr.c_str())) return false;
     if (detail) return InsertAfter(fs, "waterDetail * 1.1, Out_Color.w);", kWaterCodeA);
@@ -1203,11 +1323,27 @@ static const char* kWHeader = R"GLSL(
 #endif
 varying SAFX_HP vec3 SAFX_Wp; varying mediump vec3 SAFX_Wn; varying mediump vec3 SAFX_Lp;
 uniform SAFX_HP vec3 SAFX_Cam; uniform SAFX_HP mat4 SAFX_VP; uniform sampler2D SAFX_Refl;
-uniform mediump vec4 SAFX_P1; uniform mediump vec4 SAFX_P2; uniform mediump vec4 SAFX_P3; uniform mediump vec4 SAFX_P4; uniform mediump vec4 SAFX_P5;
+uniform mediump vec4 SAFX_P1; uniform mediump vec4 SAFX_P2; uniform mediump vec4 SAFX_P3; uniform mediump vec4 SAFX_P4; uniform mediump vec4 SAFX_P5; uniform mediump vec4 SAFX_P6;
 float SAFX_h(SAFX_HP vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
 float SAFX_n(SAFX_HP vec2 p){
   SAFX_HP vec2 i = floor(p); SAFX_HP vec2 f = fract(p); f = f * f * (3.0 - 2.0 * f);
   return mix(mix(SAFX_h(i), SAFX_h(i + vec2(1.0, 0.0)), f.x), mix(SAFX_h(i + vec2(0.0, 1.0)), SAFX_h(i + vec2(1.0, 1.0)), f.x), f.y);
+}
+vec3 SAFX_bead(SAFX_HP vec2 uv, float cover, float seed){
+  SAFX_HP vec2 bi = floor(uv);
+  vec2 bf = fract(uv) - 0.5;
+  float h1 = SAFX_h(bi + seed);
+  float h2 = SAFX_h(bi + seed + 17.3);
+  float h3 = SAFX_h(bi + seed + 41.7);
+  float on = step(h1, cover);
+  vec2 off = (vec2(h2, h3) - 0.5) * 0.5;
+  float r = 0.10 + 0.17 * h2;
+  float d = length(bf - off);
+  float body = smoothstep(r, r * 0.80, d) * on;
+  float rim = (smoothstep(r, r * 0.85, d) - smoothstep(r * 0.85, r * 0.55, d)) * on;
+  vec2 hl = (bf - off) / r;
+  float sp = smoothstep(0.38, 0.0, length(hl - vec2(-0.32, 0.36))) * body;
+  return vec3(body, rim, sp);
 }
 )GLSL";
 
@@ -1266,75 +1402,89 @@ static const char* kWHaze = R"GLSL(
 )GLSL";
 
 static const char* kWGround = R"GLSL(
-  if (SAFX_nOK > 0.5 && SAFX_P3.x > 0.01 && SAFX_N.z > 0.9) {
+  if (SAFX_nOK > 0.5 && SAFX_P3.x > 0.01 && SAFX_N.z > 0.55) {
     float SAFX_W = SAFX_P3.x;
-    float SAFX_up = smoothstep(0.90, 0.98, SAFX_N.z);
+    float SAFX_up = smoothstep(0.55, 0.88, SAFX_N.z);
     float SAFX_pn = SAFX_n(SAFX_Wp.xy * 0.22) * 0.65 + SAFX_n(SAFX_Wp.xy * 0.9) * 0.35;
     float SAFX_pd = smoothstep(0.80 - 0.18 * SAFX_W, 0.87 - 0.18 * SAFX_W, SAFX_pn) * SAFX_up;
     fcolor.xyz *= 1.0 - (0.22 * SAFX_W * SAFX_up + 0.28 * SAFX_pd);
     vec2 SAFX_rp = vec2(0.0);
     float SAFX_rg = 0.0;
-    if (SAFX_P5.y > 0.5 && SAFX_P3.z > 0.02 && SAFX_pd > 0.01) {
-      SAFX_HP vec2 SAFX_q = SAFX_Wp.xy * 3.0;
+    if (SAFX_P5.y > 0.5 && SAFX_P3.z > 0.02) {
+      SAFX_HP vec2 SAFX_q = SAFX_Wp.xy * 4.0;
       SAFX_HP vec2 SAFX_id = floor(SAFX_q);
       vec2 SAFX_f = fract(SAFX_q) - 0.5;
-      float SAFX_ph = fract(SAFX_P3.w * 0.9 + SAFX_h(SAFX_id));
-      float SAFX_ring = smoothstep(0.07, 0.0, abs(length(SAFX_f) - SAFX_ph * 0.45)) * (1.0 - SAFX_ph);
-      SAFX_rg = SAFX_ring * step(0.45, SAFX_h(SAFX_id + 7.0)) * SAFX_P3.z;
-      SAFX_rp = SAFX_f * SAFX_rg * 0.04;
+      float SAFX_ph = fract(SAFX_P3.w * 1.1 + SAFX_h(SAFX_id));
+      float SAFX_on = step(0.40, SAFX_h(SAFX_id + 7.0));
+      float SAFX_ring = smoothstep(0.06, 0.0, abs(length(SAFX_f) - SAFX_ph * 0.5)) * (1.0 - SAFX_ph);
+      float SAFX_cr = smoothstep(0.10, 0.0, length(SAFX_f)) * max(0.0, 1.0 - SAFX_ph * 5.0);
+      SAFX_rg = (SAFX_ring + SAFX_cr * 1.4) * SAFX_on * SAFX_P3.z * SAFX_P6.y * SAFX_up;
+      SAFX_rp = SAFX_f * SAFX_rg * 0.03;
     }
     vec3 SAFX_R = reflect(SAFX_V, vec3(0.0, 0.0, 1.0));
-    SAFX_HP vec4 SAFX_c = SAFX_VP * vec4(SAFX_Wp + SAFX_R * 28.0, 1.0);
+    vec3 SAFX_R2 = normalize(vec3(SAFX_R.xy, max(SAFX_R.z * 2.2, 0.22)));
+    SAFX_HP vec4 SAFX_c = SAFX_VP * vec4(SAFX_Wp + SAFX_R2 * 90.0, 1.0);
     vec2 SAFX_uv = SAFX_c.xy / SAFX_c.w * 0.5 + 0.5 + SAFX_rp;
     float SAFX_mu = smoothstep(0.14, 0.24, SAFX_uv.x) * smoothstep(0.86, 0.76, SAFX_uv.x);
     float SAFX_mv = smoothstep(0.04, 0.16, SAFX_uv.y) * smoothstep(0.78, 0.66, SAFX_uv.y);
     float SAFX_vis = (SAFX_c.w > 0.1) ? SAFX_mu * SAFX_mv : 0.0;
-    vec3 SAFX_rc = texture2D(SAFX_Refl, clamp(SAFX_uv, 0.003, 0.997)).rgb;
+    vec3 SAFX_rc = texture2D(SAFX_Refl, clamp(SAFX_uv, 0.003, 0.997)).rgb * 0.5
+                 + texture2D(SAFX_Refl, clamp(SAFX_uv + vec2(0.0, 0.012), 0.003, 0.997)).rgb * 0.25
+                 + texture2D(SAFX_Refl, clamp(SAFX_uv - vec2(0.0, 0.012), 0.003, 0.997)).rgb * 0.25;
     vec3 SAFX_sk = mix(FogColor, FogColor * 1.25 + vec3(0.04, 0.07, 0.12), clamp(SAFX_R.z * 1.5, 0.0, 1.0)) * 1.4;
     SAFX_rc = mix(SAFX_sk, SAFX_rc, SAFX_vis);
     float SAFX_F = 0.04 + 0.96 * pow(1.0 - clamp(-SAFX_V.z, 0.0, 1.0), 5.0);
     fcolor.xyz = mix(fcolor.xyz, SAFX_rc, clamp(SAFX_pd * (0.30 + 0.70 * SAFX_F) * SAFX_P5.x, 0.0, 0.90));
-    fcolor.xyz += SAFX_P2.xyz * (pow(max(dot(SAFX_R, SAFX_P1.xyz), 0.0), 90.0) * SAFX_pd * SAFX_sunUp * 1.2 + SAFX_rg * 0.10);
+    fcolor.xyz += SAFX_P2.xyz * (pow(max(dot(SAFX_R, SAFX_P1.xyz), 0.0), 90.0) * SAFX_pd * SAFX_sunUp * 1.2);
+    fcolor.xyz += vec3(0.80, 0.90, 1.00) * SAFX_rg * 0.12;
   }
 )GLSL";
 
 static const char* kWCar = R"GLSL(
   if (SAFX_P3.y > 0.01 && SAFX_P5.z > 0.01) {
     float SAFX_cv = SAFX_P3.y * SAFX_P5.z;
-    SAFX_HP vec2 SAFX_bu = Out_Tex0 * 26.0;
-    SAFX_HP vec2 SAFX_bi = floor(SAFX_bu);
-    vec2 SAFX_bf = fract(SAFX_bu) - 0.5;
-    float SAFX_h1 = SAFX_h(SAFX_bi);
-    float SAFX_h2 = SAFX_h(SAFX_bi + 17.3);
-    float SAFX_h3 = SAFX_h(SAFX_bi + 41.7);
-    float SAFX_on = step(SAFX_h1, SAFX_cv * 0.55);
-    vec2 SAFX_of = (vec2(SAFX_h2, SAFX_h3) - 0.5) * 0.40;
-    float SAFX_r = 0.07 + 0.12 * SAFX_h2;
-    float SAFX_d = length(SAFX_bf - SAFX_of);
-    float SAFX_body = smoothstep(SAFX_r, SAFX_r * 0.72, SAFX_d) * SAFX_on;
-    float SAFX_rim = (smoothstep(SAFX_r, SAFX_r * 0.78, SAFX_d) - smoothstep(SAFX_r * 0.78, SAFX_r * 0.50, SAFX_d)) * SAFX_on;
-    vec2 SAFX_hl = (SAFX_bf - SAFX_of) / SAFX_r;
-    float SAFX_sp = smoothstep(0.35, 0.0, length(SAFX_hl - vec2(-0.30, 0.35))) * SAFX_body;
+    float SAFX_dn = SAFX_P6.x;
+    vec2 SAFX_pl = SAFX_Lp.xy + SAFX_Lp.zz * 0.5;
+    float SAFX_hzc = SAFX_Lp.x;
+    float SAFX_vert = 0.0;
+#ifdef GL_OES_standard_derivatives
+    SAFX_HP vec3 SAFX_lg = cross(dFdx(SAFX_Lp) * 16.0, dFdy(SAFX_Lp) * 16.0);
+    vec3 SAFX_la = abs(SAFX_lg);
+    if (SAFX_la.z >= SAFX_la.x && SAFX_la.z >= SAFX_la.y) {
+      SAFX_pl = SAFX_Lp.xy;
+    } else if (SAFX_la.y >= SAFX_la.x) {
+      SAFX_pl = SAFX_Lp.xz; SAFX_hzc = SAFX_Lp.x; SAFX_vert = 1.0;
+    } else {
+      SAFX_pl = SAFX_Lp.yz; SAFX_hzc = SAFX_Lp.y; SAFX_vert = 1.0;
+    }
+#endif
+    vec3 SAFX_b1 = SAFX_bead(SAFX_pl * 12.0, SAFX_cv * 0.30 * SAFX_dn, 0.0);
+    vec3 SAFX_b2 = SAFX_bead(SAFX_pl * 24.0 + 3.1, SAFX_cv * 0.50 * SAFX_dn, 7.0);
+    vec3 SAFX_b3 = SAFX_bead(SAFX_pl * 46.0 + 9.7, SAFX_cv * 0.75 * SAFX_dn, 13.0);
+    float SAFX_body = clamp(SAFX_b1.x + SAFX_b2.x + SAFX_b3.x, 0.0, 1.0);
+    float SAFX_rim = clamp(SAFX_b1.y + SAFX_b2.y + SAFX_b3.y, 0.0, 1.0);
+    float SAFX_spc = clamp(SAFX_b1.z + SAFX_b2.z + SAFX_b3.z, 0.0, 1.0);
     vec3 SAFX_skyc = FogColor * 1.4;
-    fcolor.xyz = mix(fcolor.xyz, fcolor.xyz * 0.75 + SAFX_skyc * 0.12, SAFX_body * 0.35);
-    fcolor.xyz *= 1.0 - 0.40 * SAFX_rim;
-    fcolor.xyz += (SAFX_P2.xyz * 0.5 + 0.1) * SAFX_sp * 0.22 * (0.25 + 0.75 * SAFX_sunUp);
-    if (SAFX_P5.w > 0.5) {
-      SAFX_HP vec2 SAFX_su = vec2(SAFX_Lp.x * 6.0 + SAFX_Lp.y * 4.1, SAFX_Lp.z * 2.2);
+    fcolor.xyz = mix(fcolor.xyz, fcolor.xyz * 0.72 + SAFX_skyc * 0.10, SAFX_body * 0.55);
+    fcolor.xyz *= 1.0 - 0.35 * SAFX_rim;
+    fcolor.xyz += (SAFX_P2.xyz * 0.5 + 0.12) * SAFX_spc * 0.30 * (0.30 + 0.70 * SAFX_sunUp);
+    if (fcolor.a < 0.92) { fcolor.a = max(fcolor.a, SAFX_body * 0.75 + SAFX_rim * 0.25); }
+    if (SAFX_P5.w > 0.5 && SAFX_vert > 0.5) {
+      SAFX_HP vec2 SAFX_su = vec2(SAFX_hzc * 9.0, SAFX_Lp.z * 2.4);
       SAFX_HP float SAFX_col = floor(SAFX_su.x);
       float SAFX_sh = SAFX_h(vec2(SAFX_col, 3.0));
       float SAFX_cz = floor(SAFX_su.y);
       float SAFX_fz = fract(SAFX_su.y);
       float SAFX_hp = 1.0 - fract(SAFX_sh * 7.0 + SAFX_P3.w * (0.05 + 0.09 * SAFX_sh));
       float SAFX_xx = abs(fract(SAFX_su.x) - 0.5 - (SAFX_sh - 0.5) * 0.4);
-      float SAFX_ln = smoothstep(0.05, 0.0, SAFX_xx);
-      float SAFX_bulb = smoothstep(0.06, 0.0, abs(SAFX_fz - SAFX_hp)) * SAFX_ln;
-      float SAFX_tr = step(SAFX_hp, SAFX_fz) * clamp(1.0 - (SAFX_fz - SAFX_hp) * 2.2, 0.0, 1.0) * smoothstep(0.025, 0.0, SAFX_xx);
-      float SAFX_pr = step(SAFX_h(vec2(SAFX_col, SAFX_cz)), SAFX_cv * 0.30);
-      float SAFX_sl = (1.0 - smoothstep(0.7, 0.95, abs(SAFX_N.z))) * SAFX_nOK;
-      float SAFX_sm = (SAFX_bulb * 0.7 + SAFX_tr * 0.25) * SAFX_pr * SAFX_sl;
-      fcolor.xyz = mix(fcolor.xyz, fcolor.xyz * 0.80 + SAFX_skyc * 0.12, SAFX_sm);
-      fcolor.xyz += (SAFX_P2.xyz * 0.4 + 0.1) * SAFX_bulb * SAFX_pr * SAFX_sl * 0.10 * (0.25 + 0.75 * SAFX_sunUp);
+      float SAFX_ln = smoothstep(0.07, 0.0, SAFX_xx);
+      float SAFX_bulb = smoothstep(0.08, 0.0, abs(SAFX_fz - SAFX_hp)) * SAFX_ln;
+      float SAFX_tr = step(SAFX_hp, SAFX_fz) * clamp(1.0 - (SAFX_fz - SAFX_hp) * 1.8, 0.0, 1.0) * smoothstep(0.03, 0.0, SAFX_xx);
+      float SAFX_pr = step(SAFX_h(vec2(SAFX_col, SAFX_cz)), SAFX_cv * 0.35 * SAFX_dn);
+      float SAFX_sm = (SAFX_bulb * 0.8 + SAFX_tr * 0.30) * SAFX_pr;
+      fcolor.xyz = mix(fcolor.xyz, fcolor.xyz * 0.78 + SAFX_skyc * 0.12, SAFX_sm);
+      fcolor.xyz += (SAFX_P2.xyz * 0.4 + 0.1) * SAFX_bulb * SAFX_pr * 0.14 * (0.30 + 0.70 * SAFX_sunUp);
+      if (fcolor.a < 0.92) { fcolor.a = max(fcolor.a, SAFX_sm * 0.6); }
     }
   }
 )GLSL";
