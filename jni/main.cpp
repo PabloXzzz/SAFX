@@ -885,11 +885,11 @@ static void LoadConfig4() {
 
 
 // ---- luces dinamicas: se capturan los coronas que registra el juego (farolas, faros, semaforos) ----
-struct LRec { float x, y, z, r, g, b, rad; uint32_t stamp; int kind; };   // kind: 1 = vehiculo, 2 = farola, 0 = otro (semaforos, etc.)
+struct LRec { float x, y, z, r, g, b, rad; uint32_t stamp; int kind; void* owner; };   // kind: 1 = vehiculo, 2 = farola, 0 = otro (semaforos, etc.)
 static LRec gLB[256]; static bool gLSeen[256];
 static float* pCloudCov = nullptr;
 static int gCoronaCalls = 0;
-static int gLightN = 0; static float gLP[8][4], gLC[8][4]; static int gLK[8];
+static int gLightN = 0; static float gLP[8][4], gLC[8][4], gLD[8][4]; static int gLK[8];
 static int ClassifyCorona(bool veh, unsigned char r, unsigned char g, unsigned char b, float radius) {
     if (veh) return 1;
     float mx = fmaxf((float)r, fmaxf((float)g, (float)b)), mn = fminf((float)r, fminf((float)g, (float)b));
@@ -897,7 +897,7 @@ static int ClassifyCorona(bool veh, unsigned char r, unsigned char g, unsigned c
     if ((mx - mn) / mx > 0.75f) return 0;      // rojo/verde puros: semaforos y senales
     return 2;
 }
-static void StoreCorona(unsigned long long id, bool veh, unsigned char r, unsigned char g, unsigned char b, unsigned char a, const float* pos, float radius, float farClip) {
+static void StoreCorona(unsigned long long id, void* owner, bool veh, unsigned char r, unsigned char g, unsigned char b, unsigned char a, const float* pos, float radius, float farClip) {
     gCoronaCalls++;
     if (!pos || a < 24 || radius < 0.01f) return;
     int slot = (int)(id % 256);
@@ -905,7 +905,7 @@ static void StoreCorona(unsigned long long id, bool veh, unsigned char r, unsign
     float k = (a / 255.f);
     L.x = pos[0]; L.y = pos[1]; L.z = pos[2];
     L.r = (r / 255.f) * k; L.g = (g / 255.f) * k; L.b = (b / 255.f) * k; L.rad = radius;
-    L.kind = ClassifyCorona(veh, r, g, b, radius);
+    L.kind = ClassifyCorona(veh, r, g, b, radius); L.owner = owner;
     L.stamp = (uint32_t)(NowSec() * 1000.0);
     static int nLogged = 0;
     if (nLogged < 40 && !gLSeen[slot]) {   // para clasificar luces en la siguiente version
@@ -918,13 +918,35 @@ typedef void (*CoronaFnB)(unsigned long long, void*, unsigned char, unsigned cha
 static CoronaFnA CoronaA_orig = nullptr; static CoronaFnB CoronaB_orig = nullptr;
 static void CoronaA_hook(unsigned long long id, void* ent, unsigned char r, unsigned char g, unsigned char b, unsigned char a, const float* pos, float radius, float farClip,
                          unsigned char t0, unsigned char t1, unsigned char t2, unsigned char t3, unsigned char t4, float angle, bool lng, float nearClip, bool fade, float fadeSpeed, bool below, bool delay) {
-    StoreCorona(id, ent != nullptr, r, g, b, a, pos, radius, farClip);
+    StoreCorona(id, ent, ent != nullptr, r, g, b, a, pos, radius, farClip);
     CoronaA_orig(id, ent, r, g, b, a, pos, radius, farClip, t0, t1, t2, t3, t4, angle, lng, nearClip, fade, fadeSpeed, below, delay);
 }
 static void CoronaB_hook(unsigned long long id, void* ent, unsigned char r, unsigned char g, unsigned char b, unsigned char a, const float* pos, float radius, float farClip, void* tex,
                          unsigned char t1, unsigned char t2, unsigned char t3, unsigned char t4, float angle, bool lng, float nearClip, bool fade, float fadeSpeed, bool below, bool delay) {
-    StoreCorona(id, ent != nullptr, r, g, b, a, pos, radius, farClip);
+    StoreCorona(id, ent, ent != nullptr, r, g, b, a, pos, radius, farClip);
     CoronaB_orig(id, ent, r, g, b, a, pos, radius, farClip, tex, t1, t2, t3, t4, angle, lng, nearClip, fade, fadeSpeed, below, delay);
+}
+// ---- direccion de los faros: se captura la matriz del vehiculo cuando el juego dibuja el haz ----
+struct BRec { void* veh; float fx, fy, fz; uint32_t stamp; };
+static BRec gBR[32]; static int gBeamCalls = 0;
+static void (*Beam_orig)(void*, int, void*, unsigned char) = nullptr;
+static void Beam_hook(void* self, int id, void* mat, unsigned char r) {
+    gBeamCalls++;
+    if (mat) {
+        const float* m = (const float*)mat;
+        float ln = sqrtf(m[4] * m[4] + m[5] * m[5] + m[6] * m[6]);
+        if (ln > 0.9f && ln < 1.1f && fabsf(m[12]) < 20000.f) {
+            BRec& b = gBR[(int)(((uintptr_t)self >> 4) % 32)];
+            b.veh = self; b.fx = m[4] / ln; b.fy = m[5] / ln; b.fz = m[6] / ln; b.stamp = (uint32_t)(NowSec() * 1000.0);
+        }
+    }
+    Beam_orig(self, id, mat, r);
+}
+static bool FindBeam(void* owner, uint32_t now, float* d) {
+    if (!owner) return false;
+    const BRec& b = gBR[(int)(((uintptr_t)owner >> 4) % 32)];
+    if (b.veh != owner || (uint32_t)(now - b.stamp) > 400u) return false;
+    d[0] = b.fx; d[1] = b.fy; d[2] = b.fz; return true;
 }
 static void SelectLights(const float* cp) {
     gLightN = 0;
@@ -941,9 +963,13 @@ static void SelectLights(const float* cp) {
         while (pos > 0 && bd[pos - 1] > d2) pos--;
         if (pos >= 8) continue;
         int last = n < 8 ? n : 7;
-        for (int k = last; k > pos; k--) { bd[k] = bd[k - 1]; memcpy(gLP[k], gLP[k - 1], 16); memcpy(gLC[k], gLC[k - 1], 16); gLK[k] = gLK[k - 1]; }
+        for (int k = last; k > pos; k--) { bd[k] = bd[k - 1]; memcpy(gLP[k], gLP[k - 1], 16); memcpy(gLC[k], gLC[k - 1], 16); memcpy(gLD[k], gLD[k - 1], 16); gLK[k] = gLK[k - 1]; }
         bd[pos] = d2;
         float rng = L4.lightRange * fminf(fmaxf(0.6f + 0.5f * L.rad, 0.7f), 1.6f);
+        float dv[3] = {0, 0, 0};
+        bool spot = (L.kind == 1 && L.rad >= 0.25f && (L.r + L.g + L.b) > 0.8f && FindBeam(L.owner, now, dv));
+        if (spot) rng *= 1.8f;
+        gLD[pos][0] = dv[0]; gLD[pos][1] = dv[1]; gLD[pos][2] = dv[2]; gLD[pos][3] = spot ? 1.f : 0.f;
         gLP[pos][0] = L.x; gLP[pos][1] = L.y; gLP[pos][2] = L.z; gLP[pos][3] = rng;
         gLC[pos][0] = L.r; gLC[pos][1] = L.g; gLC[pos][2] = L.b; gLC[pos][3] = L.rad; gLK[pos] = L.kind;
         if (n < 8) n++;
@@ -952,8 +978,8 @@ static void SelectLights(const float* cp) {
 }
 
 // ---- uniformes SAFX_* que los shaders parcheados del juego necesitan cada frame ----
-struct GP2 { GLuint id; GLint u[13]; };   // 0..5 = P0..P5, 6 = Cam, 7 = VP, 8 = Refl, 9 = P6, 10 = P7, 11 = LP, 12 = LC
-static const char* kUN[13] = { "SAFX_P0", "SAFX_P1", "SAFX_P2", "SAFX_P3", "SAFX_P4", "SAFX_P5", "SAFX_Cam", "SAFX_VP", "SAFX_Refl", "SAFX_P6", "SAFX_P7", "SAFX_LP", "SAFX_LC" };
+struct GP2 { GLuint id; GLint u[14]; };   // 0..5 = P0..P5, 6 = Cam, 7 = VP, 8 = Refl, 9 = P6, 10 = P7, 11 = LP, 12 = LC
+static const char* kUN[14] = { "SAFX_P0", "SAFX_P1", "SAFX_P2", "SAFX_P3", "SAFX_P4", "SAFX_P5", "SAFX_Cam", "SAFX_VP", "SAFX_Refl", "SAFX_P6", "SAFX_P7", "SAFX_LP", "SAFX_LC", "SAFX_LD" };
 static GP2 gP2[200]; static int gNP2 = 0;
 static void RescanPrograms2() {
     for (GLuint p = 1; p <= 3000 && gNP2 < 200; p++) {
@@ -962,7 +988,7 @@ static void RescanPrograms2() {
         for (int i = 0; i < gNP2; i++) if (gP2[i].id == p) { known = true; break; }
         if (known) continue;
         GP2 g; g.id = p; bool any = false;
-        for (int k = 0; k < 13; k++) { g.u[k] = glGetUniformLocation(p, kUN[k]); if (g.u[k] >= 0) any = true; }
+        for (int k = 0; k < 14; k++) { g.u[k] = glGetUniformLocation(p, kUN[k]); if (g.u[k] >= 0) any = true; }
         if (any) gP2[gNP2++] = g;
     }
     while (glGetError() != GL_NO_ERROR) {}
@@ -988,6 +1014,7 @@ static void UploadGameUniforms2(const float* VP, const float* camPos, float wetG
         if (g.u[10] >= 0) glUniform4f(g.u[10], L4.carRefl, L4.lightStrength, 0.f, 0.f);
         if (g.u[11] >= 0) glUniform4fv(g.u[11], 8, &gLP[0][0]);
         if (g.u[12] >= 0) glUniform4fv(g.u[12], 8, &gLC[0][0]);
+        if (g.u[13] >= 0) glUniform4fv(g.u[13], 8, &gLD[0][0]);
     }
 }
 
@@ -1037,25 +1064,35 @@ float hudm(vec2 u){
 
 // ---- resplandor de luces (halo volumetrico, con prueba de profundidad para que los muros lo tapen) ----
 static const char* kVSGlow = R"GLSL(
-attribute vec2 aPos; uniform mat4 uVP; uniform vec4 uP; uniform vec3 uR; uniform vec3 uU; varying vec2 vC;
-void main(){ vC = aPos; vec3 w = uP.xyz + (uR * aPos.x + uU * aPos.y) * uP.w; gl_Position = uVP * vec4(w, 1.0); }
+attribute vec2 aPos; uniform mat4 uVP; uniform vec4 uP; uniform vec3 uR; uniform vec3 uU; varying vec2 vC; varying vec2 vCuv;
+void main(){
+  vC = aPos;
+  vec4 cc = uVP * vec4(uP.xyz, 1.0);
+  vCuv = cc.xy / cc.w * 0.5 + 0.5;
+  vec3 w = uP.xyz + (uR * aPos.x + uU * aPos.y) * uP.w;
+  gl_Position = uVP * vec4(w, 1.0);
+}
 )GLSL";
 static const char* kFSGlowA = R"GLSL(
 precision mediump float;
-varying vec2 vC; uniform vec3 uCol; uniform vec4 uS; uniform vec2 uRes; uniform float uHud;
+varying vec2 vC; varying vec2 vCuv; uniform vec3 uCol; uniform vec4 uS; uniform vec2 uRes; uniform float uHud; uniform sampler2D uScene;
 )GLSL";
 static const char* kFSGlowB = R"GLSL(
+float lm(vec3 c){ return max(c.r, max(c.g, c.b)); }
 void main(){
   float q = dot(vC, vC);
   float core = exp(-q * 9.0);
   float halo = exp(-q * 2.6) * (1.0 - smoothstep(0.7, 1.0, q));
   float a = core * 0.8 + halo * uS.y;
+  vec2 cu = clamp(vCuv, 0.01, 0.99);
+  float mx = max(max(lm(texture2D(uScene, cu).rgb), lm(texture2D(uScene, cu + vec2(0.006, 0.0)).rgb)), max(lm(texture2D(uScene, cu - vec2(0.006, 0.0)).rgb), lm(texture2D(uScene, cu + vec2(0.0, 0.010)).rgb)));
+  float vis = uS.w > 0.5 ? 0.15 + 0.85 * smoothstep(0.3, 0.7, mx) : 1.0;
   vec2 suv = gl_FragCoord.xy / uRes;
-  gl_FragColor = vec4(uCol * a * uS.x * hudm(suv), 1.0);
+  gl_FragColor = vec4(uCol * a * uS.x * vis * hudm(suv), 1.0);
 }
 )GLSL";
 static GLuint gGlowProg = 0; static bool gGlowFail = false;
-static GLint gl_VP = -1, gl_P = -1, gl_R = -1, gl_U = -1, gl_Col = -1, gl_S = -1, gl_Res = -1, gl_Hud = -1;
+static GLint gl_VP = -1, gl_P = -1, gl_R = -1, gl_U = -1, gl_Col = -1, gl_S = -1, gl_Res = -1, gl_Hud = -1, gl_Scene = -1;
 static bool DrawGlow(const float* VP, const float* cam, int w, int h, float rain) {
     if (gGlowFail || gLightN <= 0) return true;
     if (!gGlowProg) {
@@ -1065,7 +1102,7 @@ static bool DrawGlow(const float* VP, const float* cam, int w, int h, float rain
         gl_VP = glGetUniformLocation(gGlowProg, "uVP"); gl_P = glGetUniformLocation(gGlowProg, "uP");
         gl_R = glGetUniformLocation(gGlowProg, "uR"); gl_U = glGetUniformLocation(gGlowProg, "uU");
         gl_Col = glGetUniformLocation(gGlowProg, "uCol"); gl_S = glGetUniformLocation(gGlowProg, "uS");
-        gl_Res = glGetUniformLocation(gGlowProg, "uRes"); gl_Hud = glGetUniformLocation(gGlowProg, "uHud");
+        gl_Res = glGetUniformLocation(gGlowProg, "uRes"); gl_Hud = glGetUniformLocation(gGlowProg, "uHud"); gl_Scene = glGetUniformLocation(gGlowProg, "uScene");
         FLog("resplandor listo");
     }
     GLint df = 0; glGetIntegerv(GL_DEPTH_FUNC, &df);
@@ -1078,6 +1115,7 @@ static bool DrawGlow(const float* VP, const float* cam, int w, int h, float rain
     glUniformMatrix4fv(gl_VP, 1, GL_FALSE, VP);
     glUniform3f(gl_R, cam[0], cam[1], cam[2]); glUniform3f(gl_U, cam[4], cam[5], cam[6]);
     glUniform2f(gl_Res, (float)w, (float)h); glUniform1f(gl_Hud, L4.cloudHud);
+    glActiveTexture(GL_TEXTURE0 + 6); glUniform1i(gl_Scene, 6);
     static const float quad[8] = { -1.f, -1.f, 1.f, -1.f, -1.f, 1.f, 1.f, 1.f };
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glEnableVertexAttribArray(0); glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, quad);
@@ -1091,9 +1129,99 @@ static bool DrawGlow(const float* VP, const float* cam, int w, int h, float rain
         float k = L4.glowStrength * dayK;
         glUniform4f(gl_P, gLP[i][0], gLP[i][1], gLP[i][2], size);
         glUniform3f(gl_Col, gLC[i][0] * k, gLC[i][1] * k, gLC[i][2] * k);
-        glUniform4f(gl_S, nf, 0.45f + 0.7f * rain, 0.f, 0.f);
+        glUniform4f(gl_S, nf, 0.45f + 0.7f * rain, 0.f, gLK[i] == 2 ? 1.f : 0.f);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     }
+    glActiveTexture(GL_TEXTURE0);
+    glDepthFunc((GLenum)df);
+    return true;
+}
+
+// ---- haces volumetricos: conos aditivos desde faros (con direccion) y farolas (hacia abajo) ----
+static const char* kVSBeam = R"GLSL(
+attribute vec2 aPos; uniform mat4 uVP; uniform vec3 uA; uniform vec3 uD; uniform vec3 uU; uniform vec3 uV; uniform vec3 uCam; uniform vec2 uLR;
+varying float vT; varying float vF; varying vec2 vCuv;
+void main(){
+  float t = aPos.x; float ang = aPos.y;
+  vec3 rad = uU * cos(ang) + uV * sin(ang);
+  vec3 w = uA + uD * (t * uLR.x) + rad * (t * uLR.y);
+  vec3 n = normalize(rad * uLR.x - uD * uLR.y);
+  vec3 vd = normalize(w - uCam);
+  vT = t; vF = abs(dot(n, vd));
+  vec4 cc = uVP * vec4(uA, 1.0); vCuv = cc.xy / cc.w * 0.5 + 0.5;
+  gl_Position = uVP * vec4(w, 1.0);
+}
+)GLSL";
+static const char* kFSBeamA = R"GLSL(
+precision mediump float;
+varying float vT; varying float vF; varying vec2 vCuv;
+uniform vec3 uCol; uniform vec4 uS; uniform vec2 uRes; uniform float uHud; uniform sampler2D uScene;
+)GLSL";
+static const char* kFSBeamB = R"GLSL(
+float lm(vec3 c){ return max(c.r, max(c.g, c.b)); }
+void main(){
+  float a = pow(max(1.0 - vT, 0.0), uS.z) * pow(vF, 0.6) * uS.x;
+  a *= smoothstep(0.0, 0.10, vT);
+  vec2 cu = clamp(vCuv, 0.01, 0.99);
+  float mx = max(max(lm(texture2D(uScene, cu).rgb), lm(texture2D(uScene, cu + vec2(0.006, 0.0)).rgb)), lm(texture2D(uScene, cu - vec2(0.006, 0.0)).rgb));
+  float vis = uS.w > 0.5 ? 0.15 + 0.85 * smoothstep(0.3, 0.7, mx) : 1.0;
+  gl_FragColor = vec4(uCol * a * vis * hudm(gl_FragCoord.xy / uRes), 1.0);
+}
+)GLSL";
+static GLuint gBeamProg = 0; static bool gBeamFail = false;
+static GLint bm_VP = -1, bm_A = -1, bm_D = -1, bm_U = -1, bm_V = -1, bm_Cam = -1, bm_LR = -1, bm_Col = -1, bm_S = -1, bm_Res = -1, bm_Hud = -1, bm_Scene = -1;
+static float gConeV[2 * 17 * 2];
+static bool DrawBeams(const float* VP, const float* cam, int w, int h, float rain) {
+    if (gBeamFail || gLightN <= 0) return true;
+    if (!gBeamProg) {
+        std::string fs = std::string(kFSBeamA) + kHudMaskGLSL + kFSBeamB;
+        gBeamProg = Link(kVSBeam, fs.c_str());
+        if (!gBeamProg) { gBeamFail = true; FLog("haces: el shader no compila"); return false; }
+        bm_VP = glGetUniformLocation(gBeamProg, "uVP"); bm_A = glGetUniformLocation(gBeamProg, "uA");
+        bm_D = glGetUniformLocation(gBeamProg, "uD"); bm_U = glGetUniformLocation(gBeamProg, "uU");
+        bm_V = glGetUniformLocation(gBeamProg, "uV"); bm_Cam = glGetUniformLocation(gBeamProg, "uCam");
+        bm_LR = glGetUniformLocation(gBeamProg, "uLR"); bm_Col = glGetUniformLocation(gBeamProg, "uCol");
+        bm_S = glGetUniformLocation(gBeamProg, "uS"); bm_Res = glGetUniformLocation(gBeamProg, "uRes");
+        bm_Hud = glGetUniformLocation(gBeamProg, "uHud"); bm_Scene = glGetUniformLocation(gBeamProg, "uScene");
+        for (int i = 0; i <= 16; i++) {
+            float ang = 6.2831853f * (float)i / 16.f;
+            gConeV[i * 4 + 0] = 0.f; gConeV[i * 4 + 1] = ang; gConeV[i * 4 + 2] = 1.f; gConeV[i * 4 + 3] = ang;
+        }
+        FLog("haces listos");
+    }
+    GLint df = 0; glGetIntegerv(GL_DEPTH_FUNC, &df);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0); glViewport(0, 0, w, h);
+    glDisable(GL_CULL_FACE); glDisable(GL_SCISSOR_TEST); glDisable(GL_STENCIL_TEST);
+    glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LEQUAL); glDepthMask(GL_FALSE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glEnable(GL_BLEND); glBlendFunc(GL_ONE, GL_ONE);
+    glUseProgram(gBeamProg);
+    glUniformMatrix4fv(bm_VP, 1, GL_FALSE, VP);
+    glUniform3f(bm_Cam, cam[12], cam[13], cam[14]);
+    glUniform2f(bm_Res, (float)w, (float)h); glUniform1f(bm_Hud, L4.cloudHud);
+    glActiveTexture(GL_TEXTURE0 + 6); glUniform1i(bm_Scene, 6);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glEnableVertexAttribArray(0); glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, gConeV);
+    float night = 0.15f + 0.85f * (1.f - F.sunUp);
+    for (int i = 0; i < gLightN; i++) {
+        bool head = gLD[i][3] > 0.5f; bool lamp = gLK[i] == 2;
+        if (!head && !lamp) continue;
+        float d[3] = { 0.f, 0.f, -1.f }; float len = 9.f, rad = 4.2f, k = 0.15f;
+        if (head) { d[0] = gLD[i][0]; d[1] = gLD[i][1]; d[2] = gLD[i][2]; len = 15.f; rad = 4.6f; k = 0.22f; }
+        float up[3] = { 0.f, 0.f, 1.f }; if (fabsf(d[2]) > 0.95f) { up[0] = 1.f; up[1] = 0.f; up[2] = 0.f; }
+        float u[3] = { d[1] * up[2] - d[2] * up[1], d[2] * up[0] - d[0] * up[2], d[0] * up[1] - d[1] * up[0] };
+        float ul = sqrtf(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]); if (ul < 1e-4f) continue;
+        u[0] /= ul; u[1] /= ul; u[2] /= ul;
+        float v[3] = { d[1] * u[2] - d[2] * u[1], d[2] * u[0] - d[0] * u[2], d[0] * u[1] - d[1] * u[0] };
+        float inten = L4.glowStrength * k * night * (1.f + 1.2f * rain);
+        glUniform3f(bm_A, gLP[i][0], gLP[i][1], gLP[i][2]);
+        glUniform3f(bm_D, d[0], d[1], d[2]); glUniform3f(bm_U, u[0], u[1], u[2]); glUniform3f(bm_V, v[0], v[1], v[2]);
+        glUniform2f(bm_LR, len, rad);
+        glUniform3f(bm_Col, gLC[i][0], gLC[i][1], gLC[i][2]);
+        glUniform4f(bm_S, inten, 0.f, 1.5f, lamp ? 1.f : 0.f);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 34);
+    }
+    glActiveTexture(GL_TEXTURE0);
     glDepthFunc((GLenum)df);
     return true;
 }
@@ -1414,7 +1542,7 @@ static void RunFX() {
     float VPm[16]; bool vpOK = camOK && GetViewProj(VPm, cam + 12);
     if (camOK) SelectLights(cam + 12); else gLightN = 0;
     UploadGameUniforms2(vpOK ? VPm : nullptr, camOK ? cam + 12 : nullptr, wetGroundUse, wetCar, rainNow);
-    if ((frame % 900) == 1) FLog("coronas=%d luces=%d nubes=%d resplandor=%d reflejos=%.2f", gCoronaCalls, gLightN, (int)(gCloudProg != 0), (int)(gGlowProg != 0), L4.carRefl);
+    if ((frame % 900) == 1) FLog("coronas=%d luces=%d faros=%d nubes=%d resplandor=%d haces=%d reflejos=%.2f", gCoronaCalls, gLightN, gBeamCalls, (int)(gCloudProg != 0), (int)(gGlowProg != 0), (int)(gBeamProg != 0), L4.carRefl);
     if (vpOK && L4.cloudsOn > 0.5f && outdoors && envK > 0.05f)
         DrawClouds(VPm, cam + 12, w, h, rainNow, pWind ? fminf(fmaxf(*pWind, 0.f), 1.5f) : 0.3f);
 
@@ -1425,7 +1553,7 @@ static void RunFX() {
                                 pWind ? fminf(fmaxf(*pWind, 0.f), 1.5f) : 0.3f, F.t);
     gHideNativeRain = rain3dDone;
     float rainShown = rain3dDone ? 0.f : rainK;
-    if (vpOK && L4.glowOn > 0.5f && gLightN > 0 && outdoors) DrawGlow(VPm, cam, w, h, rainNow);
+    if (vpOK && L4.glowOn > 0.5f && gLightN > 0 && outdoors) { DrawBeams(VPm, cam, w, h, rainNow); DrawGlow(VPm, cam, w, h, rainNow); }
 
     if (anyFX) {
         glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE); glDisable(GL_SCISSOR_TEST);
@@ -1593,7 +1721,7 @@ static bool PatchWater(std::string& vs, std::string& fs) {
     if (!InsertBeforeMain(vs, "varying mediump vec3 SAFX_View;\n")) return false;
     if (!InsertAfter(vs, kWorldPosAnchor, "\n\tSAFX_View = WorldPos.xyz - CameraPosition.xyz;\n")) return false;
     bool detail = fs.find("waterDetail * 1.1, Out_Color.w);") != std::string::npos;
-    std::string hdr = "varying mediump vec3 SAFX_View;\nuniform mediump vec4 SAFX_P1;\nuniform mediump vec4 SAFX_P2;\nuniform mediump vec4 SAFX_P3;\nuniform mediump vec4 SAFX_P4;\nuniform mediump vec4 SAFX_P6;\n";
+    std::string hdr = "varying mediump vec3 SAFX_View;\nuniform mediump vec4 SAFX_P1;\nuniform mediump vec4 SAFX_P2;\n#ifdef GL_FRAGMENT_PRECISION_HIGH\nuniform highp vec4 SAFX_P3;\n#else\nuniform mediump vec4 SAFX_P3;\n#endif\nuniform mediump vec4 SAFX_P4;\nuniform mediump vec4 SAFX_P6;\n";
     if (!detail) hdr += kWaterHdrB;
     if (!InsertBeforeMain(fs, hdr.c_str())) return false;
     if (detail) return InsertAfter(fs, "waterDetail * 1.1, Out_Color.w);", kWaterCodeA);
@@ -1624,8 +1752,8 @@ static const char* kWHeader = R"GLSL(
 #endif
 varying SAFX_HP vec3 SAFX_Wp; varying mediump vec3 SAFX_Wn; varying mediump vec3 SAFX_Lp;
 uniform SAFX_HP vec3 SAFX_Cam; uniform SAFX_HP mat4 SAFX_VP; uniform sampler2D SAFX_Refl;
-uniform mediump vec4 SAFX_P1; uniform mediump vec4 SAFX_P2; uniform mediump vec4 SAFX_P3; uniform mediump vec4 SAFX_P4; uniform mediump vec4 SAFX_P5; uniform mediump vec4 SAFX_P6; uniform mediump vec4 SAFX_P7;
-uniform SAFX_HP vec4 SAFX_LP[8]; uniform mediump vec4 SAFX_LC[8];
+uniform mediump vec4 SAFX_P1; uniform mediump vec4 SAFX_P2; uniform SAFX_HP vec4 SAFX_P3; uniform mediump vec4 SAFX_P4; uniform mediump vec4 SAFX_P5; uniform mediump vec4 SAFX_P6; uniform mediump vec4 SAFX_P7;
+uniform SAFX_HP vec4 SAFX_LP[8]; uniform mediump vec4 SAFX_LC[8]; uniform mediump vec4 SAFX_LD[8];
 float SAFX_h(SAFX_HP vec2 p){
   SAFX_HP vec3 p3 = fract(vec3(p.xyx) * 0.1031);
   p3 += dot(p3, p3.yzx + 33.33);
@@ -1725,16 +1853,18 @@ static const char* kWGround = R"GLSL(
     float SAFX_t0 = 0.64 - 0.16 * SAFX_W;
     float SAFX_edge = smoothstep(SAFX_t0 - 0.07, SAFX_t0 + 0.05, SAFX_pn) * SAFX_up;
     float SAFX_pd = smoothstep(SAFX_t0 + 0.02, SAFX_t0 + 0.20, SAFX_pn) * SAFX_up;
-    fcolor.xyz *= 1.0 - (0.20 * SAFX_W * SAFX_up + 0.18 * SAFX_edge + 0.12 * SAFX_pd);
+    float SAFX_lum = dot(fcolor.xyz, vec3(0.33));
+    fcolor.xyz = mix(fcolor.xyz, vec3(SAFX_lum) * 0.55 + fcolor.xyz * 0.15, SAFX_pd * 0.6);
+    fcolor.xyz *= 1.0 - (0.20 * SAFX_W * SAFX_up + 0.18 * SAFX_edge + 0.10 * SAFX_pd);
     vec2 SAFX_rp = vec2(0.0);
     float SAFX_rg = 0.0;
     if (SAFX_P5.y > 0.5 && SAFX_P3.z > 0.02 && SAFX_W > 0.15) {
       SAFX_HP vec2 SAFX_q = SAFX_Wp.xy * 0.9;
       SAFX_HP vec2 SAFX_id = floor(SAFX_q);
       vec2 SAFX_f = fract(SAFX_q) - 0.5;
-      float SAFX_tt = SAFX_P3.w * 0.7 + SAFX_h(SAFX_id) * 7.0;
-      float SAFX_cyc = floor(SAFX_tt);
-      float SAFX_ph = fract(SAFX_tt);
+      SAFX_HP float SAFX_tt = SAFX_P3.w * 0.7 + SAFX_h(SAFX_id) * 7.0;
+      SAFX_HP float SAFX_cyc = floor(SAFX_tt);
+      float SAFX_ph = SAFX_tt - SAFX_cyc;
       SAFX_HP vec2 SAFX_id2 = SAFX_id + SAFX_cyc * 17.13;
       float SAFX_on = step(1.0 - 0.6 * SAFX_P3.z, SAFX_h(SAFX_id2 + 7.0));
       vec2 SAFX_off = (vec2(SAFX_h(SAFX_id2), SAFX_h(SAFX_id2 + 3.3)) - 0.5) * 0.08;
@@ -1756,14 +1886,19 @@ static const char* kWGround = R"GLSL(
     float SAFX_mu = smoothstep(0.10, 0.30, SAFX_uv.x) * smoothstep(0.90, 0.70, SAFX_uv.x);
     float SAFX_mv = smoothstep(0.02, 0.20, SAFX_uv.y) * smoothstep(0.80, 0.60, SAFX_uv.y);
     float SAFX_vis = (SAFX_c.w > 0.1) ? SAFX_mu * SAFX_mv : 0.0;
-    vec3 SAFX_rc = texture2D(SAFX_Refl, clamp(SAFX_uv, 0.003, 0.997)).rgb * 0.5
-                 + texture2D(SAFX_Refl, clamp(SAFX_uv + vec2(0.0, 0.012), 0.003, 0.997)).rgb * 0.25
-                 + texture2D(SAFX_Refl, clamp(SAFX_uv - vec2(0.0, 0.012), 0.003, 0.997)).rgb * 0.25;
     vec3 SAFX_sk = mix(FogColor, FogColor * 1.15 + vec3(0.02, 0.04, 0.07), clamp(SAFX_R.z * 1.5, 0.0, 1.0));
     SAFX_sk = mix(SAFX_sk, vec3(dot(SAFX_sk, vec3(0.33))), 0.30) * 1.15;
-    SAFX_rc = mix(SAFX_sk, SAFX_rc, SAFX_vis * 0.85);
+    vec3 SAFX_rc = SAFX_sk;
+    if (SAFX_pd > 0.02) {
+      vec3 SAFX_acc = vec3(0.0);
+      for (int j = 0; j < 9; j++) {
+        vec2 SAFX_o = vec2(float(j - 3 * (j / 3)) - 1.0, float(j / 3) - 1.0) * 0.045;
+        SAFX_acc += texture2D(SAFX_Refl, clamp(SAFX_uv + SAFX_o, 0.003, 0.997)).rgb;
+      }
+      SAFX_rc = mix(SAFX_sk, SAFX_acc * 0.1111, SAFX_vis * 0.35);
+    }
     float SAFX_F = 0.04 + 0.96 * pow(1.0 - clamp(-SAFX_V.z, 0.0, 1.0), 5.0);
-    fcolor.xyz = mix(fcolor.xyz, SAFX_rc, clamp(SAFX_pd * (0.22 + 0.78 * SAFX_F) * SAFX_P5.x, 0.0, 0.85));
+    fcolor.xyz = mix(fcolor.xyz, SAFX_rc, clamp(SAFX_pd * (0.30 + 0.70 * SAFX_F) * SAFX_P5.x, 0.0, 0.80));
     fcolor.xyz += SAFX_P2.xyz * (pow(max(dot(SAFX_R, SAFX_P1.xyz), 0.0), 90.0) * SAFX_pd * SAFX_sunUp * 1.2);
     fcolor.xyz += vec3(0.85, 0.92, 1.00) * SAFX_rg * 0.55;
   }
@@ -1804,7 +1939,8 @@ static const char* kWCar = R"GLSL(
       SAFX_HP float SAFX_cz = floor(SAFX_su.y);
       float SAFX_sh = SAFX_h(vec2(SAFX_col, 3.0));
       float SAFX_pr = step(SAFX_h(vec2(SAFX_col, SAFX_cz)), SAFX_cv * 0.22 * SAFX_dn);
-      float SAFX_hp = 1.0 - fract(SAFX_sh * 7.0 + SAFX_P3.w * (0.04 + 0.07 * SAFX_sh));
+      SAFX_HP float SAFX_tq = SAFX_sh * 7.0 + SAFX_P3.w * (0.04 + 0.07 * SAFX_sh);
+      float SAFX_hp = 1.0 - (SAFX_tq - floor(SAFX_tq));
       float SAFX_fz = fract(SAFX_su.y);
       float SAFX_cx = fract(SAFX_su.x) - 0.5 - (SAFX_sh - 0.5) * 0.3;
       float SAFX_dy = (SAFX_fz - SAFX_hp) * 3.8;
@@ -1833,7 +1969,9 @@ static const char* kWLights = R"GLSL(
       float SAFX_rg2 = SAFX_LP[i].w * SAFX_LP[i].w;
       float SAFX_at = 1.0 - clamp(SAFX_dd / SAFX_rg2, 0.0, 1.0);
       SAFX_at *= SAFX_at;
-      float SAFX_nl = (SAFX_nOK > 0.5) ? clamp(dot(SAFX_N, SAFX_ld * inversesqrt(max(SAFX_dd, 0.01))) * 0.6 + 0.4, 0.0, 1.0) : 0.6;
+      vec3 SAFX_ln = SAFX_ld * inversesqrt(max(SAFX_dd, 0.01));
+      float SAFX_nl = (SAFX_nOK > 0.5) ? clamp(dot(SAFX_N, SAFX_ln) * 0.6 + 0.4, 0.0, 1.0) : 0.6;
+      if (SAFX_LD[i].w > 0.5) SAFX_nl *= smoothstep(0.78, 0.93, dot(-SAFX_ln, SAFX_LD[i].xyz));
       SAFX_acc += SAFX_LC[i].xyz * (SAFX_at * SAFX_nl);
     }
     float SAFX_nk = 1.0 - 0.96 * smoothstep(0.0, 0.5, SAFX_sunUp);
@@ -1866,7 +2004,7 @@ static bool StmtEnd(const std::string& s, const char* start, size_t& endPos) {
     endPos = e + 1; return true;
 }
 
-static bool PatchWorld(std::string& vs, std::string& fs, bool vehicle) {
+static bool PatchWorld(std::string& vs, std::string& fs, bool vehicle, bool skinned = false) {
     if (fs.find("FogColor") == std::string::npos || fs.find("gl_FragColor = fcolor;") == std::string::npos) return false;
     if (vs.find("void main") == std::string::npos) return false;
     size_t wp = 0, wn = 0;
@@ -1884,7 +2022,7 @@ static bool PatchWorld(std::string& vs, std::string& fs, bool vehicle) {
     if (L4.giOn > 0.5f) body += kWGI;
     if (L4.lightsOn > 0.5f) body += kWLights;
     if (L4.hazeOn > 0.5f) body += kWHaze;
-    if (!vehicle && L4.puddles > 0.5f) body += kWGround;
+    if (!vehicle && !skinned && L4.puddles > 0.5f) body += kWGround;
     if (vehicle && L4.carRefl > 0.05f) body += kWCarRefl;
     if (vehicle && L4.carRain > 0.5f && fs.find("Out_Tex0") != std::string::npos) body += kWCar;
     body += "}\n";
@@ -1935,6 +2073,7 @@ static uint64_t Build_hook(void* self, const char* a1, const char* a2) {
         bool foliage = !water && v0.find("BoneToLocal") == std::string::npos && v0.find(kWorldPosAnchor) != std::string::npos
                        && f0.find("discard") != std::string::npos && f0.find("EnvMapCoefficient") == std::string::npos;
         bool vehicle = f0.find("EnvMapCoefficient") != std::string::npos;
+        bool skinned = v0.find("BoneToLocal") != std::string::npos;
         bool doWind = foliage && C.wind > 0.5f;
         bool doWorld = !water && !skyVar && wantWorld && f0.find("Out_Color") != std::string::npos;
         if (g_nBuildCalls <= 6 || g_nBuildCalls % 60 == 0)
@@ -1948,7 +2087,7 @@ static uint64_t Build_hook(void* self, const char* a1, const char* a2) {
         if (water && C.water > 0.5f) ch = PatchWater(v, f);
         else {
             if (doWind) ch |= PatchWind(v);
-            if (doWorld) ch |= PatchWorld(v, f, vehicle);
+            if (doWorld) ch |= PatchWorld(v, f, vehicle, skinned);
         }
         if (ch) {
             bool okc = TestCompile(v.c_str(), f.c_str());
@@ -2027,11 +2166,14 @@ ON_MOD_LOAD() {
     if (corA) aml->Hook(corA, (void*)CoronaA_hook, (void**)&CoronaA_orig);
     if (corB) aml->Hook(corB, (void*)CoronaB_hook, (void**)&CoronaB_orig);
     FLog("coronas: A=%p B=%p nubes(cobertura)=%p", corA, corB, (void*)pCloudCov);
-    void* rrs = sym("_ZN8CWeather16RenderRainStreaksEv");
+    void* rrs = sym("_ZN8CWeather17RenderRainStreaksEv");
     void* addr = sym("_ZN8CWeather7AddRainEv");
     if (rrs) aml->Hook(rrs, (void*)RRS_hook, (void**)&RRS_orig);
     if (addr) aml->Hook(addr, (void*)AddRain_hook, (void**)&AddRain_orig);
     FLog("lluvia nativa: streaks=%p particulas=%p", rrs, addr);
+    void* beamf = sym("_ZN8CVehicle15DoHeadLightBeamEiR7CMatrixh");
+    if (beamf) aml->Hook(beamf, (void*)Beam_hook, (void**)&Beam_orig);
+    FLog("haz de faros: %p", beamf);
     LOG("SAFX activo (rain=%p wind=%p camera=%p calc=%p build=%p grass=%p)", pRain, pWind, pTheCamera, (void*)CalcScreen, build, wind);
     FLog("simbolos: swap=%p renderScene=%p menu=%p build=%p viento=%p camara=%p rain=%p", swap, rscene, rmenu, build, wind, pTheCamera, (void*)pRain);
     FLog("hooks: swap_orig=%p build_orig=%p scene_orig=%p", (void*)Swap_orig, (void*)Build_orig, (void*)RS_orig);
