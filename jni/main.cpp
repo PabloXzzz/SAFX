@@ -811,9 +811,10 @@ struct Cfg4 {
     float cloudsOn = 1, cloudInt = 0.85f, cloudCover = 1.f, cloudHud = 1;
     float carRefl = 1.f;
     float hideStreaks = 1.f, hideNative = 1.f;
+    float shadowsOn = 1.f, shadowStrength = 0.6f, shadowSize = 2048.f, shadowRange = 70.f, shadowInterval = 2.f;
 } L4;
 static int g_nWorld = 0, g_nVeh = 0;
-static char g_logPath[340] = ""; static int g_logLines = 0;
+static char g_logPath[340] = ""; static int g_logLines = 0; static char g_bootPath[340] = ""; static bool g_bootArmed = false;
 static void FLog(const char* fmt, ...) {      // registro en <configs>/SAFX64.log (para diagnosticar sin logcat)
     if (!g_logPath[0] || g_logLines > 400) return;
     FILE* lf = fopen(g_logPath, "a"); if (!lf) return;
@@ -831,6 +832,7 @@ static Ent kEnt2[] = {
     {"Clouds","Enable",&L4.cloudsOn},{"Clouds","Intensity",&L4.cloudInt},{"Clouds","Coverage",&L4.cloudCover},{"Clouds","HudSafe",&L4.cloudHud},
     {"VehicleRefl","Strength",&L4.carRefl},
     {"NativeRain","HideStreaks",&L4.hideStreaks},{"NativeRain","HideParticles",&L4.hideNative},
+    {"Shadows","Enable",&L4.shadowsOn},{"Shadows","Strength",&L4.shadowStrength},{"Shadows","Size",&L4.shadowSize},{"Shadows","Range",&L4.shadowRange},{"Shadows","Interval",&L4.shadowInterval},
 };
 static void LoadConfig4() {
     const int NE = (int)(sizeof(kEnt) / sizeof(kEnt[0]));
@@ -879,6 +881,13 @@ static void LoadConfig4() {
             }
             fclose(o); LOG("SAFX64.ini actualizado en %s", path);
         }
+    }
+    // proteccion: si el juego se cerro durante el arranque anterior con las sombras activas, se desactivan
+    snprintf(g_bootPath, sizeof g_bootPath, "%s/SAFX64.boot", dir);
+    if (L4.shadowsOn > 0.5f) {
+        FILE* bf = fopen(g_bootPath, "r");
+        if (bf) { fclose(bf); L4.shadowsOn = 0.f; FLog("sombras DESACTIVADAS: el juego se cerro en el arranque anterior. Borra SAFX64.boot para reintentar."); }
+        else { FILE* nf = fopen(g_bootPath, "w"); if (nf) { fputs("1", nf); fclose(nf); g_bootArmed = true; } }
     }
     FLog("SAFX 0.5 cargado. config: %s", path);
 }
@@ -977,9 +986,287 @@ static void SelectLights(const float* cp) {
     gLightN = n;
 }
 
+// =============================== SOMBRAS EN TIEMPO REAL (mapa de sombras del sol) ===============================
+// Se capturan los dibujos del juego (ganchos en su tabla GOT) y se repiten desde la vista del sol.
+#include <dlfcn.h>
+#include <link.h>
+#include <elf.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#ifndef R_AARCH64_JUMP_SLOT
+#define R_AARCH64_JUMP_SLOT 1026
+#endif
+#ifndef R_AARCH64_GLOB_DAT
+#define R_AARCH64_GLOB_DAT 1025
+#endif
+static thread_local bool tlRender = false;
+struct AttrState { GLint size, type, stride; GLboolean norm; uintptr_t ptr; GLuint buf; bool set; };
+struct ProgInfo { bool known, caster, textured, hasObj; GLint objLoc, posLoc, uvLoc; float obj[16]; };
+static GLuint tProg = 0, tArrayBuf = 0, tElemBuf = 0; static int tUnit = 0; static GLuint tTex[8];
+static AttrState tAttr[16]; static ProgInfo gPI[4096];
+struct ShDraw {
+    GLuint pb, ub, eb, tex; GLint ps, pt, pst, us, ut, ust; GLboolean pn, un; uintptr_t po, uo, io;
+    GLenum mode, it; GLsizei cnt; float obj[16]; bool textured;
+};
+static ShDraw gSD[6000]; static int gNDraw = 0; static bool gRecOn = false; static bool gHooksOK = false;
+static bool gSMInit = false, gSMFail = false, gShadowReady = false; static float gSMSize = 2048.f; static float gSV[16];
+static GLuint gSMTex = 0, gSMFbo = 0, gSMRb = 0, gSMProg[2] = {0, 0};
+static GLint sm_Obj[2] = {-1, -1}, sm_LVP[2] = {-1, -1}, sm_Tex[2] = {-1, -1};
+static int gSMLast = 0; static float gSMms = 0.f;
+
+static void InitProg(GLuint p) {
+    ProgInfo& pi = gPI[p]; pi.known = true; pi.hasObj = false;
+    pi.objLoc = glGetUniformLocation(p, "ObjMatrix");
+    GLint cam = glGetUniformLocation(p, "SAFX_Cam"), bones = glGetUniformLocation(p, "Bones");
+    pi.posLoc = glGetAttribLocation(p, "Position"); pi.uvLoc = glGetAttribLocation(p, "TexCoord0");
+    pi.caster = (pi.objLoc >= 0 && cam >= 0 && bones < 0 && pi.posLoc >= 0 && pi.posLoc < 16);
+    pi.textured = (pi.uvLoc >= 0 && pi.uvLoc < 16 && glGetUniformLocation(p, "Diffuse") >= 0);
+}
+static void (*pUseProgram)(GLuint) = nullptr; static void (*pBindBuffer)(GLenum, GLuint) = nullptr;
+static void (*pVAP)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*) = nullptr;
+static void (*pUM4)(GLint, GLsizei, GLboolean, const GLfloat*) = nullptr; static void (*pBindTex)(GLenum, GLuint) = nullptr;
+static void (*pActiveTex)(GLenum) = nullptr; static void (*pDrawEl)(GLenum, GLsizei, GLenum, const void*) = nullptr;
+static void H_UseProgram(GLuint p) {
+    pUseProgram(p);
+    if (!tlRender) return;
+    tProg = p; if (p < 4096 && !gPI[p].known) InitProg(p);
+}
+static void H_BindBuffer(GLenum t, GLuint b) {
+    if (tlRender) { if (t == GL_ARRAY_BUFFER) tArrayBuf = b; else if (t == GL_ELEMENT_ARRAY_BUFFER) tElemBuf = b; }
+    pBindBuffer(t, b);
+}
+static void H_VAP(GLuint i, GLint s, GLenum t, GLboolean n, GLsizei st, const void* p) {
+    if (tlRender && i < 16) { AttrState& a = tAttr[i]; a.size = s; a.type = (GLint)t; a.stride = st; a.norm = n; a.ptr = (uintptr_t)p; a.buf = tArrayBuf; a.set = true; }
+    pVAP(i, s, t, n, st, p);
+}
+static void H_UM4(GLint loc, GLsizei c, GLboolean tr, const GLfloat* v) {
+    if (tlRender && tProg < 4096 && c == 1 && !tr) { ProgInfo& pi = gPI[tProg]; if (loc == pi.objLoc && pi.known) { memcpy(pi.obj, v, 64); pi.hasObj = true; } }
+    pUM4(loc, c, tr, v);
+}
+static void H_ActiveTex(GLenum t) { if (tlRender) tUnit = (int)t - (int)GL_TEXTURE0; pActiveTex(t); }
+static void H_BindTex(GLenum t, GLuint id) { if (tlRender && t == GL_TEXTURE_2D && tUnit >= 0 && tUnit < 8) tTex[tUnit] = id; pBindTex(t, id); }
+static void H_DrawEl(GLenum mode, GLsizei count, GLenum type, const void* ind) {
+    if (gRecOn && tlRender && gNDraw < 6000 && tProg < 4096) {
+        ProgInfo& pi = gPI[tProg];
+        if (pi.caster && pi.hasObj && tElemBuf) {
+            const AttrState& ap = tAttr[pi.posLoc];
+            if (ap.set && ap.buf) {
+                ShDraw& d = gSD[gNDraw];
+                d.pb = ap.buf; d.ps = ap.size; d.pt = ap.type; d.pst = ap.stride; d.pn = ap.norm; d.po = ap.ptr;
+                bool tx = pi.textured && tAttr[pi.uvLoc].set && tAttr[pi.uvLoc].buf && tTex[0];
+                d.textured = tx;
+                if (tx) { const AttrState& au = tAttr[pi.uvLoc]; d.ub = au.buf; d.us = au.size; d.ut = au.type; d.ust = au.stride; d.un = au.norm; d.uo = au.ptr; d.tex = tTex[0]; }
+                d.eb = tElemBuf; d.mode = mode; d.it = type; d.cnt = count; d.io = (uintptr_t)ind; memcpy(d.obj, pi.obj, 64);
+                gNDraw++;
+            }
+        }
+    }
+    pDrawEl(mode, count, type, ind);
+}
+struct GotCtx { const char* so; const char* sym; void* hook; void** orig; int patched; };
+static uintptr_t FixAddr(uintptr_t base, uintptr_t v) { return v >= base ? v : base + v; }
+static int GotCb(struct dl_phdr_info* info, size_t, void* data) {
+    GotCtx* c = (GotCtx*)data;
+    if (!info->dlpi_name || !strstr(info->dlpi_name, c->so)) return 0;
+    uintptr_t base = (uintptr_t)info->dlpi_addr;
+    const ElfW(Dyn)* dyn = nullptr;
+    for (int i = 0; i < info->dlpi_phnum; i++) if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) dyn = (const ElfW(Dyn)*)(base + info->dlpi_phdr[i].p_vaddr);
+    if (!dyn) return 1;
+    const ElfW(Sym)* symtab = nullptr; const char* strtab = nullptr;
+    const ElfW(Rela)* tabs[2] = { nullptr, nullptr }; size_t szs[2] = { 0, 0 };
+    for (const ElfW(Dyn)* d = dyn; d->d_tag != DT_NULL; d++) {
+        switch (d->d_tag) {
+            case DT_SYMTAB: symtab = (const ElfW(Sym)*)FixAddr(base, d->d_un.d_ptr); break;
+            case DT_STRTAB: strtab = (const char*)FixAddr(base, d->d_un.d_ptr); break;
+            case DT_JMPREL: tabs[0] = (const ElfW(Rela)*)FixAddr(base, d->d_un.d_ptr); break;
+            case DT_PLTRELSZ: szs[0] = d->d_un.d_val; break;
+            case DT_RELA: tabs[1] = (const ElfW(Rela)*)FixAddr(base, d->d_un.d_ptr); break;
+            case DT_RELASZ: szs[1] = d->d_un.d_val; break;
+            default: break;
+        }
+    }
+    if (!symtab || !strtab) return 1;
+    for (int t = 0; t < 2; t++) {
+        if (!tabs[t]) continue;
+        size_t n = szs[t] / sizeof(ElfW(Rela));
+        for (size_t i = 0; i < n; i++) {
+            unsigned type = (unsigned)ELF64_R_TYPE(tabs[t][i].r_info), si = (unsigned)ELF64_R_SYM(tabs[t][i].r_info);
+            if ((type != R_AARCH64_JUMP_SLOT && type != R_AARCH64_GLOB_DAT) || !si) continue;
+            if (strcmp(strtab + symtab[si].st_name, c->sym) != 0) continue;
+            void** slot = (void**)(base + tabs[t][i].r_offset);
+            long pg = sysconf(_SC_PAGESIZE);
+            uintptr_t page = (uintptr_t)slot & ~(uintptr_t)(pg - 1);
+            if (mprotect((void*)page, (size_t)pg, PROT_READ | PROT_WRITE) != 0) continue;
+            if (!*c->orig) *c->orig = dlsym(RTLD_DEFAULT, c->sym);
+            if (!*c->orig) continue;
+            *slot = c->hook; c->patched++;
+        }
+    }
+    return 1;
+}
+static bool HookGot(const char* sym, void* hook, void** orig) {
+    GotCtx c = { "libGTASA.so", sym, hook, orig, 0 };
+    dl_iterate_phdr(GotCb, &c);
+    return c.patched > 0 && *orig;
+}
+static bool InstallGLHooks() {
+    bool a = HookGot("glUseProgram", (void*)H_UseProgram, (void**)&pUseProgram);
+    bool b = HookGot("glBindBuffer", (void*)H_BindBuffer, (void**)&pBindBuffer);
+    bool c = HookGot("glVertexAttribPointer", (void*)H_VAP, (void**)&pVAP);
+    bool d = HookGot("glUniformMatrix4fv", (void*)H_UM4, (void**)&pUM4);
+    bool e = HookGot("glBindTexture", (void*)H_BindTex, (void**)&pBindTex);
+    bool f = HookGot("glActiveTexture", (void*)H_ActiveTex, (void**)&pActiveTex);
+    bool g = HookGot("glDrawElements", (void*)H_DrawEl, (void**)&pDrawEl);
+    FLog("ganchos GL: use=%d buf=%d ptr=%d mat=%d tex=%d act=%d draw=%d", a, b, c, d, e, f, g);
+    return a && b && c && d && e && f && g;
+}
+
+static const char* kVSShadow = R"GLSL(
+precision highp float;
+attribute vec3 aPos; attribute vec2 aUV; uniform mat4 uObj; uniform mat4 uLVP; varying float vD; varying vec2 vUV;
+void main(){
+  vec4 c = uLVP * (uObj * vec4(aPos, 1.0));
+  vD = clamp(c.z * 0.5 + 0.5, 0.0, 0.99999);
+  vUV = aUV;
+  gl_Position = c;
+}
+)GLSL";
+static const char* kFSShadow = R"GLSL(
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+varying float vD; varying vec2 vUV; uniform sampler2D uTex;
+void main(){
+#ifdef TEX
+  if (texture2D(uTex, vUV).a < 0.45) discard;
+#endif
+  vec4 enc = fract(vD * vec4(1.0, 255.0, 65025.0, 16581375.0));
+  enc -= enc.yzww * vec4(1.0 / 255.0, 1.0 / 255.0, 1.0 / 255.0, 0.0);
+  gl_FragColor = enc;
+}
+)GLSL";
+static GLuint LinkSM(bool tex, int k) {
+    std::string fs = std::string(tex ? "#define TEX 1\n" : "") + kFSShadow;
+    GLuint v = Compile(GL_VERTEX_SHADER, kVSShadow), f = Compile(GL_FRAGMENT_SHADER, fs.c_str());
+    if (!v || !f) return 0;
+    GLuint p = glCreateProgram(); glAttachShader(p, v); glAttachShader(p, f);
+    glBindAttribLocation(p, 0, "aPos"); glBindAttribLocation(p, 1, "aUV");
+    glLinkProgram(p);
+    GLint ok = 0; glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) return 0;
+    sm_Obj[k] = glGetUniformLocation(p, "uObj"); sm_LVP[k] = glGetUniformLocation(p, "uLVP"); sm_Tex[k] = glGetUniformLocation(p, "uTex");
+    return p;
+}
+static bool InitShadow() {
+    int S = (int)L4.shadowSize; if (S < 512) S = 512; if (S > 4096) S = 4096;
+    gSMSize = (float)S;
+    glGenTextures(1, &gSMTex); glBindTexture(GL_TEXTURE_2D, gSMTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, S, S, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glGenRenderbuffers(1, &gSMRb); glBindRenderbuffer(GL_RENDERBUFFER, gSMRb);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, S, S); glBindRenderbuffer(GL_RENDERBUFFER, 0);
+    glGenFramebuffers(1, &gSMFbo); glBindFramebuffer(GL_FRAMEBUFFER, gSMFbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, gSMTex, 0);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, gSMRb);
+    GLenum stt = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (stt != GL_FRAMEBUFFER_COMPLETE) { FLog("sombras: framebuffer incompleto (0x%x)", (unsigned)stt); return false; }
+    gSMProg[0] = LinkSM(false, 0); gSMProg[1] = LinkSM(true, 1);
+    if (!gSMProg[0] || !gSMProg[1]) { FLog("sombras: los shaders del mapa no compilan"); return false; }
+    FLog("sombras: mapa listo %dx%d", S, S);
+    return true;
+}
+static void ComputeLight(const float* cam) {
+    float L[3] = { F.sunX, F.sunY, F.sunZ };
+    float ln = sqrtf(L[0] * L[0] + L[1] * L[1] + L[2] * L[2]); if (ln < 1e-4f) ln = 1.f;
+    L[0] /= ln; L[1] /= ln; L[2] /= ln;
+    float up[3] = { 0.f, 0.f, 1.f }; if (fabsf(L[2]) > 0.98f) { up[0] = 1.f; up[2] = 0.f; }
+    float lx[3] = { up[1] * L[2] - up[2] * L[1], up[2] * L[0] - up[0] * L[2], up[0] * L[1] - up[1] * L[0] };
+    float lxl = sqrtf(lx[0] * lx[0] + lx[1] * lx[1] + lx[2] * lx[2]); if (lxl < 1e-4f) lxl = 1.f;
+    lx[0] /= lxl; lx[1] /= lxl; lx[2] /= lxl;
+    float ly[3] = { L[1] * lx[2] - L[2] * lx[1], L[2] * lx[0] - L[0] * lx[2], L[0] * lx[1] - L[1] * lx[0] };
+    float R = fmaxf(L4.shadowRange, 20.f), Z = 250.f;
+    float c[3] = { cam[12] + cam[8] * R * 0.35f, cam[13] + cam[9] * R * 0.35f, cam[14] + cam[10] * R * 0.35f };
+    float cx = c[0] * lx[0] + c[1] * lx[1] + c[2] * lx[2], cy = c[0] * ly[0] + c[1] * ly[1] + c[2] * ly[2], cz = c[0] * L[0] + c[1] * L[1] + c[2] * L[2];
+    float tx = 2.f * R / gSMSize; cx = floorf(cx / tx) * tx; cy = floorf(cy / tx) * tx;
+    gSV[0] = lx[0] / R; gSV[4] = lx[1] / R; gSV[8] = lx[2] / R; gSV[12] = -cx / R;
+    gSV[1] = ly[0] / R; gSV[5] = ly[1] / R; gSV[9] = ly[2] / R; gSV[13] = -cy / R;
+    gSV[2] = -L[0] / Z; gSV[6] = -L[1] / Z; gSV[10] = -L[2] / Z; gSV[14] = cz / Z;
+    gSV[3] = 0.f; gSV[7] = 0.f; gSV[11] = 0.f; gSV[15] = 1.f;
+}
+static GLuint gBufOkCache[512];
+static bool BufOK(GLuint b) {
+    unsigned h = b & 511u;
+    if (gBufOkCache[h] == b) return true;
+    if (!glIsBuffer(b)) return false;
+    gBufOkCache[h] = b; return true;
+}
+static void RenderShadowMap(const float* cam) {
+    double t0 = NowSec();
+    GLState st; Save(st);
+    GLint eb = 0, dfn = 0, a1en = 0, a1sz = 4, a1ty = GL_FLOAT, a1st = 0, a1bf = 0, a1nm = 0; void* a1ptr = nullptr;
+    GLboolean poly = glIsEnabled(GL_POLYGON_OFFSET_FILL); GLfloat cc[4] = { 0, 0, 0, 0 }, cd = 1.f;
+    glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &eb); glGetIntegerv(GL_DEPTH_FUNC, &dfn);
+    glGetVertexAttribiv(1, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &a1en); glGetVertexAttribiv(1, GL_VERTEX_ATTRIB_ARRAY_SIZE, &a1sz);
+    glGetVertexAttribiv(1, GL_VERTEX_ATTRIB_ARRAY_TYPE, &a1ty); glGetVertexAttribiv(1, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &a1st);
+    glGetVertexAttribiv(1, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &a1bf); glGetVertexAttribiv(1, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &a1nm);
+    glGetVertexAttribPointerv(1, GL_VERTEX_ATTRIB_ARRAY_POINTER, &a1ptr);
+    glGetFloatv(GL_COLOR_CLEAR_VALUE, cc); glGetFloatv(GL_DEPTH_CLEAR_VALUE, &cd);
+    bool ok = true;
+    if (!gSMInit) { gSMInit = true; if (!InitShadow()) { gSMFail = true; ok = false; } }
+    if (ok && !gSMFail) {
+        ComputeLight(cam);
+        int S = (int)gSMSize;
+        glBindFramebuffer(GL_FRAMEBUFFER, gSMFbo); glViewport(0, 0, S, S);
+        glDisable(GL_SCISSOR_TEST); glDisable(GL_STENCIL_TEST); glDisable(GL_BLEND); glDisable(GL_CULL_FACE); glDisable(GL_POLYGON_OFFSET_FILL);
+        glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LEQUAL); glDepthMask(GL_TRUE); glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glClearColor(1.f, 1.f, 1.f, 1.f); glClearDepthf(1.f); glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        memset(gBufOkCache, 0, sizeof gBufOkCache);
+        int cur = -1; GLuint lastPb = 0xFFFFFFFFu, lastEb = 0xFFFFFFFFu; int drawn = 0;
+        for (int i = 0; i < gNDraw; i++) {
+            const ShDraw& d = gSD[i];
+            int pr = d.textured ? 1 : 0;
+            if (!BufOK(d.pb) || !BufOK(d.eb) || (d.textured && !BufOK(d.ub))) continue;
+            if (pr != cur) {
+                glUseProgram(gSMProg[pr]); glUniformMatrix4fv(sm_LVP[pr], 1, GL_FALSE, gSV);
+                if (pr) glUniform1i(sm_Tex[pr], 0);
+                cur = pr;
+                if (pr == 0) glDisableVertexAttribArray(1);
+            }
+            glBindBuffer(GL_ARRAY_BUFFER, d.pb);
+            glVertexAttribPointer(0, d.ps, (GLenum)d.pt, d.pn, d.pst, (const void*)d.po); glEnableVertexAttribArray(0);
+            lastPb = d.pb;
+            if (d.textured) {
+                glBindBuffer(GL_ARRAY_BUFFER, d.ub);
+                glVertexAttribPointer(1, d.us, (GLenum)d.ut, d.un, d.ust, (const void*)d.uo); glEnableVertexAttribArray(1);
+                glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, d.tex);
+            }
+            if (d.eb != lastEb) { glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, d.eb); lastEb = d.eb; }
+            glUniformMatrix4fv(sm_Obj[pr], 1, GL_FALSE, d.obj);
+            glDrawElements(d.mode, d.cnt, (GLenum)d.it, (const void*)d.io);
+            drawn++;
+        }
+        (void)lastPb;
+        gSMLast = drawn; gShadowReady = true;
+    }
+    // restaurar el estado del juego
+    glBindBuffer(GL_ARRAY_BUFFER, (GLuint)a1bf);
+    glVertexAttribPointer(1, a1sz, (GLenum)a1ty, (GLboolean)a1nm, a1st, a1ptr);
+    if (a1en) glEnableVertexAttribArray(1); else glDisableVertexAttribArray(1);
+    Restore(st);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, (GLuint)eb);
+    glDepthFunc((GLenum)dfn);
+    if (poly) glEnable(GL_POLYGON_OFFSET_FILL); else glDisable(GL_POLYGON_OFFSET_FILL);
+    glClearColor(cc[0], cc[1], cc[2], cc[3]); glClearDepthf(cd);
+    while (glGetError() != GL_NO_ERROR) {}
+    gSMms = (float)((NowSec() - t0) * 1000.0);
+}
+
 // ---- uniformes SAFX_* que los shaders parcheados del juego necesitan cada frame ----
-struct GP2 { GLuint id; GLint u[14]; };   // 0..5 = P0..P5, 6 = Cam, 7 = VP, 8 = Refl, 9 = P6, 10 = P7, 11 = LP, 12 = LC
-static const char* kUN[14] = { "SAFX_P0", "SAFX_P1", "SAFX_P2", "SAFX_P3", "SAFX_P4", "SAFX_P5", "SAFX_Cam", "SAFX_VP", "SAFX_Refl", "SAFX_P6", "SAFX_P7", "SAFX_LP", "SAFX_LC", "SAFX_LD" };
+struct GP2 { GLuint id; GLint u[17]; };   // 0..5 = P0..P5, 6 = Cam, 7 = VP, 8 = Refl, 9 = P6, 10 = P7, 11 = LP, 12 = LC
+static const char* kUN[17] = { "SAFX_P0", "SAFX_P1", "SAFX_P2", "SAFX_P3", "SAFX_P4", "SAFX_P5", "SAFX_Cam", "SAFX_VP", "SAFX_Refl", "SAFX_P6", "SAFX_P7", "SAFX_LP", "SAFX_LC", "SAFX_LD", "SAFX_SV", "SAFX_SM", "SAFX_P8" };
 static GP2 gP2[200]; static int gNP2 = 0;
 static void RescanPrograms2() {
     for (GLuint p = 1; p <= 3000 && gNP2 < 200; p++) {
@@ -988,7 +1275,7 @@ static void RescanPrograms2() {
         for (int i = 0; i < gNP2; i++) if (gP2[i].id == p) { known = true; break; }
         if (known) continue;
         GP2 g; g.id = p; bool any = false;
-        for (int k = 0; k < 14; k++) { g.u[k] = glGetUniformLocation(p, kUN[k]); if (g.u[k] >= 0) any = true; }
+        for (int k = 0; k < 17; k++) { g.u[k] = glGetUniformLocation(p, kUN[k]); if (g.u[k] >= 0) any = true; }
         if (any) gP2[gNP2++] = g;
     }
     while (glGetError() != GL_NO_ERROR) {}
@@ -1015,6 +1302,9 @@ static void UploadGameUniforms2(const float* VP, const float* camPos, float wetG
         if (g.u[11] >= 0) glUniform4fv(g.u[11], 8, &gLP[0][0]);
         if (g.u[12] >= 0) glUniform4fv(g.u[12], 8, &gLC[0][0]);
         if (g.u[13] >= 0) glUniform4fv(g.u[13], 8, &gLD[0][0]);
+        if (g.u[14] >= 0) glUniformMatrix4fv(g.u[14], 1, GL_FALSE, gSV);
+        if (g.u[15] >= 0) glUniform1i(g.u[15], 7);
+        if (g.u[16] >= 0) glUniform4f(g.u[16], gShadowReady ? L4.shadowStrength * (1.f - 0.75f * rainNow) : 0.f, 1.f / gSMSize, 0.0008f, 0.f);
     }
 }
 
@@ -1443,7 +1733,7 @@ static void RunFX() {
     bool worldLoaded = true;   // falso en el menu de inicio (aun no hay partida)
     if (pTimeMs && *pTimeMs == 0) worldLoaded = false;
     if (worldLoaded && pPlayers) { uintptr_t ped = 0; if (SafeRead(pPlayers, &ped, sizeof ped) && ped == 0) worldLoaded = false; }
-    if (menu || !worldLoaded || (sceneSeen && !scene)) return;      // menus: sin efectos
+    if (menu || !worldLoaded || (sceneSeen && !scene)) { gRecOn = false; gNDraw = 0; return; }      // menus: sin efectos
 
     int w, h; ScreenSize(w, h);
     if (w < 64 || h < 64) return;
@@ -1539,6 +1829,15 @@ static void RunFX() {
     }
 
     GLState st; Save(st);
+    if (g_bootArmed && frame >= 400) { remove(g_bootPath); g_bootArmed = false; }
+    gRecOn = false;
+    if (L4.shadowsOn > 0.5f && gHooksOK && !gSMFail && camOK && outdoors && F.sunUp > 0.05f) {
+        static int sfr = 0; sfr++;
+        int iv = (int)fmaxf(L4.shadowInterval, 1.f);
+        if (gNDraw > 0 && (sfr % iv) == 0) RenderShadowMap(cam);
+        gNDraw = 0;
+        gRecOn = ((sfr + 1) % iv) == 0;
+    } else { gNDraw = 0; gShadowReady = false; }
     float VPm[16]; bool vpOK = camOK && GetViewProj(VPm, cam + 12);
     if (camOK) SelectLights(cam + 12); else gLightN = 0;
     UploadGameUniforms2(vpOK ? VPm : nullptr, camOK ? cam + 12 : nullptr, wetGroundUse, wetCar, rainNow);
@@ -1606,11 +1905,15 @@ static void RunFX() {
     }
     Restore(st);
     // la escena de este frame queda en la unidad 6 para que los charcos la reflejen en el siguiente
-    glActiveTexture(GL_TEXTURE0 + 6); glBindTexture(GL_TEXTURE_2D, tScene); glActiveTexture(st.activeTex);
+    glActiveTexture(GL_TEXTURE0 + 6); glBindTexture(GL_TEXTURE_2D, tScene);
+    if (gSMTex && gShadowReady) { glActiveTexture(GL_TEXTURE0 + 7); glBindTexture(GL_TEXTURE_2D, gSMTex); }
+    glActiveTexture(st.activeTex);
+    if ((frame % 900) == 1) FLog("sombras: ganchos=%d listo=%d dibujos=%d mapa_ms=%.1f", (int)gHooksOK, (int)gShadowReady, gSMLast, gSMms);
     while (glGetError() != GL_NO_ERROR) {}
 }
 
 static void Swap_hook(char*& cmd) {
+    tlRender = true;
     if (!gFailed) RunFX();
     Swap_orig(cmd);
 }
@@ -1754,6 +2057,7 @@ varying SAFX_HP vec3 SAFX_Wp; varying mediump vec3 SAFX_Wn; varying mediump vec3
 uniform SAFX_HP vec3 SAFX_Cam; uniform SAFX_HP mat4 SAFX_VP; uniform sampler2D SAFX_Refl;
 uniform mediump vec4 SAFX_P1; uniform mediump vec4 SAFX_P2; uniform SAFX_HP vec4 SAFX_P3; uniform mediump vec4 SAFX_P4; uniform mediump vec4 SAFX_P5; uniform mediump vec4 SAFX_P6; uniform mediump vec4 SAFX_P7;
 uniform SAFX_HP vec4 SAFX_LP[8]; uniform mediump vec4 SAFX_LC[8]; uniform mediump vec4 SAFX_LD[8];
+uniform SAFX_HP mat4 SAFX_SV; uniform sampler2D SAFX_SM; uniform mediump vec4 SAFX_P8;
 float SAFX_h(SAFX_HP vec2 p){
   SAFX_HP vec3 p3 = fract(vec3(p.xyx) * 0.1031);
   p3 += dot(p3, p3.yzx + 33.33);
@@ -1772,6 +2076,26 @@ float SAFX_pf(SAFX_HP vec2 p){
   p = mat2(0.80, -0.60, 0.60, 0.80) * p;
   a += SAFX_n(p * 1.30) * 0.15;
   return a;
+}
+vec3 SAFX_rip(SAFX_HP vec2 wp, SAFX_HP float t, float rain, float dens){
+  SAFX_HP vec2 id = floor(wp);
+  vec2 f = fract(wp) - 0.5;
+  SAFX_HP float tt = t + SAFX_h(id) * 7.0;
+  SAFX_HP float cyc = floor(tt);
+  float ph = tt - cyc;
+  SAFX_HP vec2 id2 = id + cyc * 17.13;
+  float on = step(1.0 - dens * rain, SAFX_h(id2 + 7.0));
+  vec2 off = (vec2(SAFX_h(id2), SAFX_h(id2 + 3.3)) - 0.5) * 0.08;
+  vec2 d = f - off;
+  float rr = length(d);
+  float rad = ph * 0.44;
+  float wd = 0.030 + 0.030 * ph;
+  float fade = 1.0 - ph;
+  float ring = smoothstep(wd, 0.0, abs(rr - rad)) * fade;
+  ring += smoothstep(wd, 0.0, abs(rr - rad * 0.66)) * fade * 0.55;
+  ring += smoothstep(wd, 0.0, abs(rr - rad * 0.33)) * fade * 0.30;
+  ring *= on;
+  return vec3(ring, d * ring);
 }
 vec3 SAFX_bead(SAFX_HP vec2 uv, float cover, float seed){
   SAFX_HP vec2 bi = floor(uv);
@@ -1859,25 +2183,12 @@ static const char* kWGround = R"GLSL(
     vec2 SAFX_rp = vec2(0.0);
     float SAFX_rg = 0.0;
     if (SAFX_P5.y > 0.5 && SAFX_P3.z > 0.02 && SAFX_W > 0.15) {
-      SAFX_HP vec2 SAFX_q = SAFX_Wp.xy * 0.9;
-      SAFX_HP vec2 SAFX_id = floor(SAFX_q);
-      vec2 SAFX_f = fract(SAFX_q) - 0.5;
-      SAFX_HP float SAFX_tt = SAFX_P3.w * 0.7 + SAFX_h(SAFX_id) * 7.0;
-      SAFX_HP float SAFX_cyc = floor(SAFX_tt);
-      float SAFX_ph = SAFX_tt - SAFX_cyc;
-      SAFX_HP vec2 SAFX_id2 = SAFX_id + SAFX_cyc * 17.13;
-      float SAFX_on = step(1.0 - 0.6 * SAFX_P3.z, SAFX_h(SAFX_id2 + 7.0));
-      vec2 SAFX_off = (vec2(SAFX_h(SAFX_id2), SAFX_h(SAFX_id2 + 3.3)) - 0.5) * 0.08;
-      float SAFX_rr = length(SAFX_f - SAFX_off);
-      float SAFX_rad = SAFX_ph * 0.44;
-      float SAFX_wd = 0.035 + 0.035 * SAFX_ph;
-      float SAFX_fade = 1.0 - SAFX_ph;
-      float SAFX_ring = smoothstep(SAFX_wd, 0.0, abs(SAFX_rr - SAFX_rad)) * SAFX_fade;
-      float SAFX_ring2 = smoothstep(SAFX_wd, 0.0, abs(SAFX_rr - SAFX_rad * 0.66)) * SAFX_fade * 0.55;
-      float SAFX_ring3 = smoothstep(SAFX_wd, 0.0, abs(SAFX_rr - SAFX_rad * 0.33)) * SAFX_fade * 0.30;
+      vec3 SAFX_ra = SAFX_rip(SAFX_Wp.xy * 1.7, SAFX_P3.w * 0.8, SAFX_P3.z, 0.85);
+      vec3 SAFX_rb = SAFX_rip(SAFX_Wp.xy * 2.7 + 31.7, SAFX_P3.w * 1.1 + 3.0, SAFX_P3.z, 0.75);
       float SAFX_df = 1.0 - smoothstep(18.0, 45.0, SAFX_D);
-      SAFX_rg = (SAFX_ring + SAFX_ring2 + SAFX_ring3) * SAFX_on * SAFX_P6.y * SAFX_up * SAFX_df;
-      SAFX_rp = (SAFX_f - SAFX_off) * SAFX_rg * 0.04;
+      float SAFX_kk = SAFX_P6.y * SAFX_up * SAFX_df;
+      SAFX_rg = (SAFX_ra.x + SAFX_rb.x * 0.7) * SAFX_kk;
+      SAFX_rp = (SAFX_ra.yz + SAFX_rb.yz * 0.7) * SAFX_kk * 0.04;
     }
     vec3 SAFX_R = reflect(SAFX_V, vec3(0.0, 0.0, 1.0));
     vec3 SAFX_R2 = normalize(vec3(SAFX_R.xy, max(SAFX_R.z * 2.2, 0.22)));
@@ -1900,7 +2211,7 @@ static const char* kWGround = R"GLSL(
     float SAFX_F = 0.04 + 0.96 * pow(1.0 - clamp(-SAFX_V.z, 0.0, 1.0), 5.0);
     fcolor.xyz = mix(fcolor.xyz, SAFX_rc, clamp(SAFX_pd * (0.30 + 0.70 * SAFX_F) * SAFX_P5.x, 0.0, 0.80));
     fcolor.xyz += SAFX_P2.xyz * (pow(max(dot(SAFX_R, SAFX_P1.xyz), 0.0), 90.0) * SAFX_pd * SAFX_sunUp * 1.2);
-    fcolor.xyz += vec3(0.85, 0.92, 1.00) * SAFX_rg * 0.55;
+    fcolor.xyz += (SAFX_rc * 0.7 + 0.10) * SAFX_rg * 0.30;
   }
 )GLSL";
 
@@ -1998,6 +2309,28 @@ static const char* kWCarRefl = R"GLSL(
   }
 )GLSL";
 
+static const char* kWShadow = R"GLSL(
+  if (SAFX_P8.x > 0.01 && SAFX_sunUp > 0.05) {
+    SAFX_HP vec4 SAFX_l4 = SAFX_SV * vec4(SAFX_Wp, 1.0);
+    vec2 SAFX_su = SAFX_l4.xy * 0.5 + 0.5;
+    float SAFX_sz = SAFX_l4.z * 0.5 + 0.5;
+    float SAFX_ndl = (SAFX_nOK > 0.5) ? clamp(dot(SAFX_N, SAFX_P1.xyz), 0.0, 1.0) : 0.5;
+    float SAFX_bd = SAFX_P8.z + 0.0025 * (1.0 - SAFX_ndl);
+    float SAFX_oc = 0.0;
+    for (int j = 0; j < 4; j++) {
+      vec2 SAFX_so = vec2(float(j - 2 * (j / 2)) - 0.5, float(j / 2) - 0.5) * SAFX_P8.y * 1.2;
+      SAFX_HP vec4 SAFX_sp4 = texture2D(SAFX_SM, clamp(SAFX_su + SAFX_so, 0.001, 0.999));
+      SAFX_HP float SAFX_dd = dot(SAFX_sp4, vec4(1.0, 1.0 / 255.0, 1.0 / 65025.0, 1.0 / 16581375.0));
+      SAFX_oc += (SAFX_sz - SAFX_bd > SAFX_dd) ? 1.0 : 0.0;
+    }
+    SAFX_oc *= 0.25;
+    float SAFX_ed = max(abs(SAFX_su.x - 0.5), abs(SAFX_su.y - 0.5)) * 2.0;
+    float SAFX_lt = (SAFX_nOK > 0.5) ? smoothstep(0.0, 0.25, dot(SAFX_N, SAFX_P1.xyz)) : 1.0;
+    float SAFX_sh = SAFX_oc * (1.0 - smoothstep(0.80, 0.98, SAFX_ed)) * SAFX_lt;
+    fcolor.xyz *= 1.0 - SAFX_sh * SAFX_P8.x * smoothstep(0.05, 0.30, SAFX_sunUp);
+  }
+)GLSL";
+
 static bool StmtEnd(const std::string& s, const char* start, size_t& endPos) {
     size_t p = s.find(start); if (p == std::string::npos) return false;
     size_t e = s.find(';', p); if (e == std::string::npos) return false;
@@ -2020,6 +2353,7 @@ static bool PatchWorld(std::string& vs, std::string& fs, bool vehicle, bool skin
 
     std::string body = kWCommon;
     if (L4.giOn > 0.5f) body += kWGI;
+    if (L4.shadowsOn > 0.5f) body += kWShadow;
     if (L4.lightsOn > 0.5f) body += kWLights;
     if (L4.hazeOn > 0.5f) body += kWHaze;
     if (!vehicle && !skinned && L4.puddles > 0.5f) body += kWGround;
@@ -2174,6 +2508,7 @@ ON_MOD_LOAD() {
     void* beamf = sym("_ZN8CVehicle15DoHeadLightBeamEiR7CMatrixh");
     if (beamf) aml->Hook(beamf, (void*)Beam_hook, (void**)&Beam_orig);
     FLog("haz de faros: %p", beamf);
+    if (L4.shadowsOn > 0.5f) { gHooksOK = InstallGLHooks(); FLog("sombras: ganchos %s", gHooksOK ? "instalados" : "NO instalados"); }
     LOG("SAFX activo (rain=%p wind=%p camera=%p calc=%p build=%p grass=%p)", pRain, pWind, pTheCamera, (void*)CalcScreen, build, wind);
     FLog("simbolos: swap=%p renderScene=%p menu=%p build=%p viento=%p camara=%p rain=%p", swap, rscene, rmenu, build, wind, pTheCamera, (void*)pRain);
     FLog("hooks: swap_orig=%p build_orig=%p scene_orig=%p", (void*)Swap_orig, (void*)Build_orig, (void*)RS_orig);
