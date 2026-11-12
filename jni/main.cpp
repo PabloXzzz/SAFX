@@ -810,6 +810,7 @@ struct Cfg4 {
     float glowOn = 1, glowStrength = 0.8f, glowSize = 2.0f;
     float cloudsOn = 1, cloudInt = 0.85f, cloudCover = 1.f, cloudHud = 1;
     float carRefl = 1.f;
+    float hideStreaks = 1.f, hideNative = 1.f;
 } L4;
 static int g_nWorld = 0, g_nVeh = 0;
 static char g_logPath[340] = ""; static int g_logLines = 0;
@@ -829,6 +830,7 @@ static Ent kEnt2[] = {
     {"Glow","Enable",&L4.glowOn},{"Glow","Strength",&L4.glowStrength},{"Glow","Size",&L4.glowSize},
     {"Clouds","Enable",&L4.cloudsOn},{"Clouds","Intensity",&L4.cloudInt},{"Clouds","Coverage",&L4.cloudCover},{"Clouds","HudSafe",&L4.cloudHud},
     {"VehicleRefl","Strength",&L4.carRefl},
+    {"NativeRain","HideStreaks",&L4.hideStreaks},{"NativeRain","HideParticles",&L4.hideNative},
 };
 static void LoadConfig4() {
     const int NE = (int)(sizeof(kEnt) / sizeof(kEnt[0]));
@@ -860,7 +862,8 @@ static void LoadConfig4() {
     }
     bool missing = false;
     for (int i = 0; i < NE2; i++) if (!found2[i]) missing = true;
-    if (R.cfgVer < 3.f) { D.wet = 0.f; R.cfgVer = 3.f; missing = true; }   // el brillo falso del suelo se reemplaza por charcos reales
+    if (R.cfgVer < 3.f) { D.wet = 0.f; R.cfgVer = 3.f; missing = true; }
+    if (R.cfgVer < 4.f) { L4.cloudsOn = 0.f; R.cfgVer = 4.f; missing = true; }   // nubes: desactivadas por defecto   // el brillo falso del suelo se reemplaza por charcos reales
     if (missing) {
         FILE* o = fopen(path, "w");
         if (o) {
@@ -882,31 +885,45 @@ static void LoadConfig4() {
 
 
 // ---- luces dinamicas: se capturan los coronas que registra el juego (farolas, faros, semaforos) ----
-struct LRec { float x, y, z, r, g, b, rad; uint32_t stamp; };
-static LRec gLB[256];
+struct LRec { float x, y, z, r, g, b, rad; uint32_t stamp; int kind; };   // kind: 1 = vehiculo, 2 = farola, 0 = otro (semaforos, etc.)
+static LRec gLB[256]; static bool gLSeen[256];
 static float* pCloudCov = nullptr;
 static int gCoronaCalls = 0;
-static int gLightN = 0; static float gLP[8][4], gLC[8][4];
-static void StoreCorona(unsigned long long id, unsigned char r, unsigned char g, unsigned char b, unsigned char a, const float* pos, float radius) {
+static int gLightN = 0; static float gLP[8][4], gLC[8][4]; static int gLK[8];
+static int ClassifyCorona(bool veh, unsigned char r, unsigned char g, unsigned char b, float radius) {
+    if (veh) return 1;
+    float mx = fmaxf((float)r, fmaxf((float)g, (float)b)), mn = fminf((float)r, fminf((float)g, (float)b));
+    if (mx < 40.f || radius < 0.3f) return 0;
+    if ((mx - mn) / mx > 0.75f) return 0;      // rojo/verde puros: semaforos y senales
+    return 2;
+}
+static void StoreCorona(unsigned long long id, bool veh, unsigned char r, unsigned char g, unsigned char b, unsigned char a, const float* pos, float radius, float farClip) {
     gCoronaCalls++;
     if (!pos || a < 24 || radius < 0.01f) return;
-    LRec& L = gLB[id % 256];
+    int slot = (int)(id % 256);
+    LRec& L = gLB[slot];
     float k = (a / 255.f);
     L.x = pos[0]; L.y = pos[1]; L.z = pos[2];
     L.r = (r / 255.f) * k; L.g = (g / 255.f) * k; L.b = (b / 255.f) * k; L.rad = radius;
+    L.kind = ClassifyCorona(veh, r, g, b, radius);
     L.stamp = (uint32_t)(NowSec() * 1000.0);
+    static int nLogged = 0;
+    if (nLogged < 40 && !gLSeen[slot]) {   // para clasificar luces en la siguiente version
+        gLSeen[slot] = true; nLogged++;
+        FLog("corona id=%llx veh=%d rgba=%d,%d,%d,%d radio=%.2f lejos=%.1f clase=%d", id, (int)veh, r, g, b, a, radius, farClip, L.kind);
+    }
 }
 typedef void (*CoronaFnA)(unsigned long long, void*, unsigned char, unsigned char, unsigned char, unsigned char, const float*, float, float, unsigned char, unsigned char, unsigned char, unsigned char, unsigned char, float, bool, float, bool, float, bool, bool);
 typedef void (*CoronaFnB)(unsigned long long, void*, unsigned char, unsigned char, unsigned char, unsigned char, const float*, float, float, void*, unsigned char, unsigned char, unsigned char, unsigned char, float, bool, float, bool, float, bool, bool);
 static CoronaFnA CoronaA_orig = nullptr; static CoronaFnB CoronaB_orig = nullptr;
 static void CoronaA_hook(unsigned long long id, void* ent, unsigned char r, unsigned char g, unsigned char b, unsigned char a, const float* pos, float radius, float farClip,
                          unsigned char t0, unsigned char t1, unsigned char t2, unsigned char t3, unsigned char t4, float angle, bool lng, float nearClip, bool fade, float fadeSpeed, bool below, bool delay) {
-    StoreCorona(id, r, g, b, a, pos, radius);
+    StoreCorona(id, ent != nullptr, r, g, b, a, pos, radius, farClip);
     CoronaA_orig(id, ent, r, g, b, a, pos, radius, farClip, t0, t1, t2, t3, t4, angle, lng, nearClip, fade, fadeSpeed, below, delay);
 }
 static void CoronaB_hook(unsigned long long id, void* ent, unsigned char r, unsigned char g, unsigned char b, unsigned char a, const float* pos, float radius, float farClip, void* tex,
                          unsigned char t1, unsigned char t2, unsigned char t3, unsigned char t4, float angle, bool lng, float nearClip, bool fade, float fadeSpeed, bool below, bool delay) {
-    StoreCorona(id, r, g, b, a, pos, radius);
+    StoreCorona(id, ent != nullptr, r, g, b, a, pos, radius, farClip);
     CoronaB_orig(id, ent, r, g, b, a, pos, radius, farClip, tex, t1, t2, t3, t4, angle, lng, nearClip, fade, fadeSpeed, below, delay);
 }
 static void SelectLights(const float* cp) {
@@ -924,11 +941,11 @@ static void SelectLights(const float* cp) {
         while (pos > 0 && bd[pos - 1] > d2) pos--;
         if (pos >= 8) continue;
         int last = n < 8 ? n : 7;
-        for (int k = last; k > pos; k--) { bd[k] = bd[k - 1]; memcpy(gLP[k], gLP[k - 1], 16); memcpy(gLC[k], gLC[k - 1], 16); }
+        for (int k = last; k > pos; k--) { bd[k] = bd[k - 1]; memcpy(gLP[k], gLP[k - 1], 16); memcpy(gLC[k], gLC[k - 1], 16); gLK[k] = gLK[k - 1]; }
         bd[pos] = d2;
         float rng = L4.lightRange * fminf(fmaxf(0.6f + 0.5f * L.rad, 0.7f), 1.6f);
         gLP[pos][0] = L.x; gLP[pos][1] = L.y; gLP[pos][2] = L.z; gLP[pos][3] = rng;
-        gLC[pos][0] = L.r; gLC[pos][1] = L.g; gLC[pos][2] = L.b; gLC[pos][3] = L.rad;
+        gLC[pos][0] = L.r; gLC[pos][1] = L.g; gLC[pos][2] = L.b; gLC[pos][3] = L.rad; gLK[pos] = L.kind;
         if (n < 8) n++;
     }
     gLightN = n;
@@ -973,6 +990,13 @@ static void UploadGameUniforms2(const float* VP, const float* camPos, float wetG
         if (g.u[12] >= 0) glUniform4fv(g.u[12], 8, &gLC[0][0]);
     }
 }
+
+// ---- lluvia nativa del juego: se oculta mientras la lluvia 3D propia esta activa ----
+static volatile bool gHideNativeRain = false;
+static void (*RRS_orig)() = nullptr;
+static void (*AddRain_orig)() = nullptr;
+static void RRS_hook() { if (gHideNativeRain && L4.hideStreaks > 0.5f) return; RRS_orig(); }
+static void AddRain_hook() { if (gHideNativeRain && L4.hideNative > 0.5f) return; AddRain_orig(); }
 
 // ---- utilidades de matrices ----
 static bool Inv4(const float* m, float* inv) {
@@ -1059,6 +1083,7 @@ static bool DrawGlow(const float* VP, const float* cam, int w, int h, float rain
     glEnableVertexAttribArray(0); glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, quad);
     float dayK = 0.35f + 0.65f * (1.f - F.sunUp);
     for (int i = 0; i < gLightN; i++) {
+        if (gLK[i] == 0) continue;
         float dx = gLP[i][0] - cam[12], dy = gLP[i][1] - cam[13], dz = gLP[i][2] - cam[14];
         float dist = sqrtf(dx * dx + dy * dy + dz * dz);
         float nf = fminf(fmaxf((dist - 1.5f) / 5.5f, 0.f), 1.f);
@@ -1398,6 +1423,7 @@ static void RunFX() {
     if (R.rain3d > 0.5f && C.rain > 0.5f && camOK && envK * rainRaw > 0.01f)
         rain3dDone = DrawRain3D2(cam, rainRaw * envK, (float)w / (float)h, F.windX, F.windY,
                                 pWind ? fminf(fmaxf(*pWind, 0.f), 1.5f) : 0.3f, F.t);
+    gHideNativeRain = rain3dDone;
     float rainShown = rain3dDone ? 0.f : rainK;
     if (vpOK && L4.glowOn > 0.5f && gLightN > 0 && outdoors) DrawGlow(VPm, cam, w, h, rainNow);
 
@@ -1703,25 +1729,25 @@ static const char* kWGround = R"GLSL(
     vec2 SAFX_rp = vec2(0.0);
     float SAFX_rg = 0.0;
     if (SAFX_P5.y > 0.5 && SAFX_P3.z > 0.02 && SAFX_W > 0.15) {
-      SAFX_HP vec2 SAFX_q = SAFX_Wp.xy * 1.3;
+      SAFX_HP vec2 SAFX_q = SAFX_Wp.xy * 0.9;
       SAFX_HP vec2 SAFX_id = floor(SAFX_q);
       vec2 SAFX_f = fract(SAFX_q) - 0.5;
-      float SAFX_tt = SAFX_P3.w * 1.25 + SAFX_h(SAFX_id) * 7.0;
+      float SAFX_tt = SAFX_P3.w * 0.7 + SAFX_h(SAFX_id) * 7.0;
       float SAFX_cyc = floor(SAFX_tt);
       float SAFX_ph = fract(SAFX_tt);
       SAFX_HP vec2 SAFX_id2 = SAFX_id + SAFX_cyc * 17.13;
-      float SAFX_on = step(1.0 - 0.55 * SAFX_P3.z, SAFX_h(SAFX_id2 + 7.0));
-      vec2 SAFX_off = (vec2(SAFX_h(SAFX_id2), SAFX_h(SAFX_id2 + 3.3)) - 0.5) * 0.4;
+      float SAFX_on = step(1.0 - 0.6 * SAFX_P3.z, SAFX_h(SAFX_id2 + 7.0));
+      vec2 SAFX_off = (vec2(SAFX_h(SAFX_id2), SAFX_h(SAFX_id2 + 3.3)) - 0.5) * 0.08;
       float SAFX_rr = length(SAFX_f - SAFX_off);
-      float SAFX_rad = SAFX_ph * 0.28;
-      float SAFX_wd = 0.03 + 0.03 * SAFX_ph;
-      float SAFX_fade = (1.0 - SAFX_ph) * (1.0 - SAFX_ph);
+      float SAFX_rad = SAFX_ph * 0.44;
+      float SAFX_wd = 0.035 + 0.035 * SAFX_ph;
+      float SAFX_fade = 1.0 - SAFX_ph;
       float SAFX_ring = smoothstep(SAFX_wd, 0.0, abs(SAFX_rr - SAFX_rad)) * SAFX_fade;
-      float SAFX_ring2 = smoothstep(SAFX_wd, 0.0, abs(SAFX_rr - SAFX_rad * 0.62)) * SAFX_fade * 0.6;
-      float SAFX_crown = smoothstep(0.05, 0.0, SAFX_rr) * max(0.0, 1.0 - SAFX_ph * 6.0) * (0.3 + 0.7 * SAFX_pd);
-      float SAFX_df = 1.0 - smoothstep(14.0, 32.0, SAFX_D);
-      SAFX_rg = (SAFX_ring + SAFX_ring2 + SAFX_crown * 0.5) * SAFX_on * SAFX_P6.y * SAFX_up * SAFX_df;
-      SAFX_rp = (SAFX_f - SAFX_off) * SAFX_rg * 0.03;
+      float SAFX_ring2 = smoothstep(SAFX_wd, 0.0, abs(SAFX_rr - SAFX_rad * 0.66)) * SAFX_fade * 0.55;
+      float SAFX_ring3 = smoothstep(SAFX_wd, 0.0, abs(SAFX_rr - SAFX_rad * 0.33)) * SAFX_fade * 0.30;
+      float SAFX_df = 1.0 - smoothstep(18.0, 45.0, SAFX_D);
+      SAFX_rg = (SAFX_ring + SAFX_ring2 + SAFX_ring3) * SAFX_on * SAFX_P6.y * SAFX_up * SAFX_df;
+      SAFX_rp = (SAFX_f - SAFX_off) * SAFX_rg * 0.04;
     }
     vec3 SAFX_R = reflect(SAFX_V, vec3(0.0, 0.0, 1.0));
     vec3 SAFX_R2 = normalize(vec3(SAFX_R.xy, max(SAFX_R.z * 2.2, 0.22)));
@@ -1739,7 +1765,7 @@ static const char* kWGround = R"GLSL(
     float SAFX_F = 0.04 + 0.96 * pow(1.0 - clamp(-SAFX_V.z, 0.0, 1.0), 5.0);
     fcolor.xyz = mix(fcolor.xyz, SAFX_rc, clamp(SAFX_pd * (0.22 + 0.78 * SAFX_F) * SAFX_P5.x, 0.0, 0.85));
     fcolor.xyz += SAFX_P2.xyz * (pow(max(dot(SAFX_R, SAFX_P1.xyz), 0.0), 90.0) * SAFX_pd * SAFX_sunUp * 1.2);
-    fcolor.xyz += vec3(0.85, 0.92, 1.00) * SAFX_rg * 0.30;
+    fcolor.xyz += vec3(0.85, 0.92, 1.00) * SAFX_rg * 0.55;
   }
 )GLSL";
 
@@ -1810,7 +1836,8 @@ static const char* kWLights = R"GLSL(
       float SAFX_nl = (SAFX_nOK > 0.5) ? clamp(dot(SAFX_N, SAFX_ld * inversesqrt(max(SAFX_dd, 0.01))) * 0.6 + 0.4, 0.0, 1.0) : 0.6;
       SAFX_acc += SAFX_LC[i].xyz * (SAFX_at * SAFX_nl);
     }
-    float SAFX_nk = 1.0 - 0.85 * smoothstep(0.0, 0.6, SAFX_sunUp);
+    float SAFX_nk = 1.0 - 0.96 * smoothstep(0.0, 0.5, SAFX_sunUp);
+    SAFX_acc = min(SAFX_acc, vec3(1.2));
     fcolor.xyz += (fcolor.xyz * 0.8 + 0.06) * SAFX_acc * SAFX_P7.y * SAFX_nk;
   }
 )GLSL";
@@ -1881,6 +1908,19 @@ static void DumpShader(const char* tag, const char* vs, const char* fs) {
     fclose(f); g_nDumped++;
 }
 
+static int g_nOther = 0; static size_t g_otherSeen[16];
+static void DumpOther(const char* vs, const char* fs) {
+    if (g_nOther >= 10 || !g_logPath[0]) return;
+    size_t h = std::hash<std::string>()(std::string(vs)) ^ (std::hash<std::string>()(std::string(fs)) << 1);
+    for (int i = 0; i < g_nOther; i++) if (g_otherSeen[i] == h) return;
+    char pth[360]; snprintf(pth, sizeof pth, "%s", g_logPath);
+    char* s = strstr(pth, "SAFX64.log"); if (!s) return;
+    strcpy(s, "SAFX64_other.txt");
+    FILE* f = fopen(pth, g_nOther == 0 ? "w" : "a"); if (!f) return;
+    fprintf(f, "\n========== sin parchar #%d ==========\n---- VERTEX ----\n%s\n---- FRAGMENT ----\n%s\n", g_nOther, vs, fs);
+    fclose(f); g_otherSeen[g_nOther++] = h;
+}
+
 static uint64_t Build_hook(void* self, const char* a1, const char* a2) {
     g_nBuildCalls++;
     bool wantWorld = L4.giOn > 0.5f || L4.hazeOn > 0.5f || L4.puddles > 0.5f || L4.carRain > 0.5f || L4.lightsOn > 0.5f || L4.carRefl > 0.05f;
@@ -1904,6 +1944,7 @@ static uint64_t Build_hook(void* self, const char* a1, const char* a2) {
                  (int)(f0.find("gl_FragColor = fcolor;") != std::string::npos), (int)(f0.find("FogColor") != std::string::npos));
         std::string v = v0, f = f0;
         bool ch = false;
+        if (!water && !foliage && !vehicle && !doWorld) DumpOther(v0.c_str(), f0.c_str());
         if (water && C.water > 0.5f) ch = PatchWater(v, f);
         else {
             if (doWind) ch |= PatchWind(v);
@@ -1986,6 +2027,11 @@ ON_MOD_LOAD() {
     if (corA) aml->Hook(corA, (void*)CoronaA_hook, (void**)&CoronaA_orig);
     if (corB) aml->Hook(corB, (void*)CoronaB_hook, (void**)&CoronaB_orig);
     FLog("coronas: A=%p B=%p nubes(cobertura)=%p", corA, corB, (void*)pCloudCov);
+    void* rrs = sym("_ZN8CWeather16RenderRainStreaksEv");
+    void* addr = sym("_ZN8CWeather7AddRainEv");
+    if (rrs) aml->Hook(rrs, (void*)RRS_hook, (void**)&RRS_orig);
+    if (addr) aml->Hook(addr, (void*)AddRain_hook, (void**)&AddRain_orig);
+    FLog("lluvia nativa: streaks=%p particulas=%p", rrs, addr);
     LOG("SAFX activo (rain=%p wind=%p camera=%p calc=%p build=%p grass=%p)", pRain, pWind, pTheCamera, (void*)CalcScreen, build, wind);
     FLog("simbolos: swap=%p renderScene=%p menu=%p build=%p viento=%p camara=%p rain=%p", swap, rscene, rmenu, build, wind, pTheCamera, (void*)pRain);
     FLog("hooks: swap_orig=%p build_orig=%p scene_orig=%p", (void*)Swap_orig, (void*)Build_orig, (void*)RS_orig);
